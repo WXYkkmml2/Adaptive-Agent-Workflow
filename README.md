@@ -27,7 +27,7 @@ pytest tests/ -v
 ## 项目结构
 config/settings.py — 全局配置（阈值、映射参数、权限模板）
 grid/network.py — IEEE 14-bus 网络加载与状态管理
-grid/topology.py — D0 计算（电气耦合强度 + BFS 拓扑深度）
+grid/topology.py — 计算：电气耦合强度 + BFS 拓扑深度
 grid/tools.py — 执行智能体工具库（带注册表和权限过滤）
 tests/ — 单元测试
 main.py — 演示入口

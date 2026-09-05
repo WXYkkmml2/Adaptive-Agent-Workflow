@@ -273,6 +273,29 @@ def call_tool(tool_name: str, net, **kwargs) -> dict:
 
     func = TOOL_REGISTRY[tool_name]["func"]
     try:
+        # 容错：如果传入的是 1-based 编号（例如用户/LLM 使用人类编号），
+        # 自动尝试转换为 0-based 索引以匹配 pandapower 的表索引。
+        # 常见的参数包括 bus_id, line_id, gen_id。
+        for key in ("bus_id", "line_id", "gen_id"):
+            if key in kwargs:
+                try:
+                    val = int(kwargs[key])
+                except Exception:
+                    continue
+                # 检查在 net 表中是否存在该索引，否则尝试减 1
+                table = None
+                if key == "bus_id":
+                    table = getattr(net, "bus", None)
+                elif key == "line_id":
+                    table = getattr(net, "line", None)
+                elif key == "gen_id":
+                    # gen table is named 'gen'
+                    table = getattr(net, "gen", None)
+
+                if table is not None and val not in table.index:
+                    if (val - 1) in table.index:
+                        kwargs[key] = val - 1
+        
         result = func(net, **kwargs)
         return {"success": True, "tool": tool_name, "result": result}
     except Exception as e:
