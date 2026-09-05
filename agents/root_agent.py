@@ -1,17 +1,18 @@
 """
-S2 根智能体。
+S2 根智能体。（Step 3 更新：集成 S4 重规划循环）
 
-"根智能体本质上是一个任务调度器，按 G 依次或并行放行。
- 根智能体维护一个任务状态表，检查 G 中哪些任务的前置依赖已经全部完成，
- 对这些任务分别实例化编排层智能体。"
-
-根智能体只和第一编排层交互，不直接跳到执行层。
+新增逻辑：
+  任务失败 → 检查是否有偏差信息 → 调用 Replanner → 重试
+  重试成功 → 正常继续后续任务
+  重试也失败 → 标记需要人工介入
 """
 
 import logging
 from agents.task import TaskDAG, TaskStatus
 from agents.permission import Permission
 from agents.orchestration_agent import OrchestrationAgent
+from agents.replanner import Replanner
+from agents.deviation import Deviation, DeviationType
 from agents.anti_example import AntiExampleStore
 from llm.client import LLMClient
 
@@ -20,10 +21,11 @@ logger = logging.getLogger(__name__)
 
 class RootAgent:
     """
-    根智能体：任务 DAG 调度器。
+    根智能体：任务 DAG 调度器 + S4 重规划入口。
 
-    持有 G（任务 DAG）和全局权限，按依赖关系分批激活任务。
-    每批任务中互不依赖的可以并行（MVP 中串行模拟）。
+    对应原文档：
+    "根智能体只管任务级别的状态（t1 完成了没有），
+     不管具体设备级别的比对。"
     """
 
     def __init__(
@@ -39,29 +41,26 @@ class RootAgent:
         self.network = network
         self.dag = dag
         self.llm = llm
-        self.tree_depth = tree_depth  # H
+        self.tree_depth = tree_depth
         self.d0_info = d0_info
         self.certainty = certainty
         self.permission = Permission.root_permission()
         self.anti_example_store = anti_example_store or AntiExampleStore()
 
-        # 执行记录（用于 S4 审计和回传）
         self.execution_log = []
+        self.replan_log = []   # ← Step 3 新增
+
+        # 创建重规划器
+        self.replanner = Replanner(
+            network=self.network,
+            llm=self.llm,
+            anti_example_store=self.anti_example_store,
+            d0_info=self.d0_info,
+            certainty=self.certainty,
+            tree_depth=self.tree_depth,
+        )
 
     def execute(self) -> dict:
-        """
-        执行整个任务 DAG。
-
-        流程：
-        1. 检查 DAG 中哪些任务可以执行（前置依赖已完成）
-        2. 为每个就绪任务实例化编排智能体
-        3. 收集结果，更新任务状态
-        4. 重复直到所有任务完成或出现不可恢复的失败
-        
-        对应原文档：
-        "根智能体检查 G 中哪些任务的前置依赖已经全部完成，
-         对这些任务分别实例化编排层智能体"
-        """
         logger.info("=" * 50)
         logger.info("[根智能体] 开始执行任务 DAG")
         logger.info(f"  树深度 H = {self.tree_depth}")
@@ -70,19 +69,18 @@ class RootAgent:
         logger.info("=" * 50)
 
         iteration = 0
-        max_iterations = len(self.dag.tasks) * 2  # 防止死循环
+        max_iterations = len(self.dag.tasks) * 3  # 留余量给重规划
 
         while not self.dag.all_completed() and iteration < max_iterations:
             iteration += 1
 
-            # 获取当前可执行的任务
             ready_tasks = self.dag.get_ready_tasks()
 
             if not ready_tasks:
                 if self.dag.has_failed():
-                    logger.error("[根智能体] 存在失败任务且无新任务可执行，流程终止")
+                    logger.error("[根智能体] 存在失败任务且无新任务可执行")
                     break
-                logger.warning("[根智能体] 无可执行任务（可能存在循环依赖）")
+                logger.warning("[根智能体] 无可执行任务")
                 break
 
             logger.info(
@@ -91,9 +89,6 @@ class RootAgent:
                 f"({', '.join(t.id for t in ready_tasks)})"
             )
 
-            # 对每个就绪任务实例化编排智能体
-            # 对应原文档："同时激活两个编排智能体分别处理 t1 和 t5"
-            # MVP 中串行执行，生产环境可改为并发
             for task in ready_tasks:
                 self.dag.update_status(task.id, TaskStatus.ACTIVE)
                 result = self._dispatch_task(task)
@@ -102,13 +97,27 @@ class RootAgent:
                     self.dag.update_status(task.id, TaskStatus.COMPLETED, result)
                     logger.info(f"[根智能体] ✓ 任务 {task.id} 完成")
                 else:
-                    self.dag.update_status(task.id, TaskStatus.FAILED, result)
-                    logger.error(
-                        f"[根智能体] ✗ 任务 {task.id} 失败: "
-                        f"{result.get('error', '未知原因')}"
-                    )
-                    # 失败处理：Step 3 实现 S4 重规划
-                    # 当前先标记失败，不阻塞无依赖关系的其他任务
+                    # ---- Step 3: S4 重规划 ----
+                    logger.warning(f"[根智能体] ✗ 任务 {task.id} 失败，启动 S4")
+                    replan_result = self._handle_task_failure(task, result)
+
+                    if replan_result.get("success", False):
+                        self.dag.update_status(
+                            task.id, TaskStatus.COMPLETED, replan_result
+                        )
+                        logger.info(
+                            f"[根智能体] ✓ 任务 {task.id} 重规划后成功"
+                        )
+                    elif replan_result.get("needs_human", False):
+                        self.dag.update_status(task.id, TaskStatus.FAILED, replan_result)
+                        logger.error(
+                            f"[根智能体] ⚠ 任务 {task.id} 需要人工介入"
+                        )
+                    else:
+                        self.dag.update_status(task.id, TaskStatus.FAILED, replan_result)
+                        logger.error(
+                            f"[根智能体] ✗ 任务 {task.id} 重规划失败"
+                        )
 
                 self.execution_log.append({
                     "task_id": task.id,
@@ -116,7 +125,6 @@ class RootAgent:
                     "result": result,
                 })
 
-        # 汇总最终结果
         success = self.dag.all_completed()
         status_summary = {
             tid: t.status.value for tid, t in self.dag.tasks.items()
@@ -127,28 +135,25 @@ class RootAgent:
         for tid, status in status_summary.items():
             marker = "✓" if status == "completed" else "✗"
             logger.info(f"  {marker} {tid}: {status}")
+        if self.replan_log:
+            logger.info(f"  重规划次数: {len(self.replan_log)}")
+            logger.info(f"  反例库大小: {self.anti_example_store.size()}")
         logger.info("=" * 50)
 
         return {
             "success": success,
             "task_status": status_summary,
             "execution_log": self.execution_log,
+            "replan_log": self.replan_log,
             "task_results": self.dag.get_task_results(),
+            "anti_example_count": self.anti_example_store.size(),
         }
 
     def _dispatch_task(self, task) -> dict:
-        """
-        为一个任务实例化编排智能体。
-
-        "根智能体只和第一编排层交互，不直接跳到执行层。"
-        """
-        # 从任务推导子权限，和根权限取交集
         task_permission = Permission.from_task(task)
         child_permission = self.permission.intersect(task_permission)
-
         agent_id = f"orch_1_{task.id}"
 
-        # 收集前置任务的结果，作为编排智能体的上下文
         prior_results = {}
         for dep_id in task.dependencies:
             dep_task = self.dag.tasks.get(dep_id)
@@ -161,8 +166,8 @@ class RootAgent:
             permission=child_permission,
             network=self.network,
             llm=self.llm,
-            current_depth=1,           # 第一编排层
-            max_depth=self.tree_depth,  # H
+            current_depth=1,
+            max_depth=self.tree_depth,
             prior_results=prior_results,
             anti_example_store=self.anti_example_store,
             d0_info=self.d0_info,
@@ -170,3 +175,48 @@ class RootAgent:
         )
 
         return orch_agent.execute()
+
+    def _handle_task_failure(self, task, result: dict) -> dict:
+        """
+        S4 入口：处理失败任务。
+
+        对应原文档：
+        "如果是失败，出现了问题，S4 来做反馈、自学习。
+         假设 t1 失败了，t2 依赖于 t1，那 t2 先不跑，
+         等 t1 重规划成功了再跑 t2。"
+        """
+        # 从结果中提取偏差信息
+        deviation = result.get("deviation")
+
+        if deviation is None:
+            # 没有结构化偏差信息，构造一个通用的
+            deviation = Deviation(
+                deviation_type=DeviationType.INSUFFICIENT,
+                description=result.get("error", "任务执行失败"),
+                expected="任务成功完成",
+                actual=str(result.get("error", "未知")),
+                task_id=task.id,
+            )
+
+        # 收集前置任务结果
+        prior_results = {}
+        for dep_id in task.dependencies:
+            dep_task = self.dag.tasks.get(dep_id)
+            if dep_task and dep_task.result:
+                prior_results[dep_id] = dep_task.result
+
+        # 调用重规划器
+        replan_result = self.replanner.handle_failure(
+            task=task,
+            deviation=deviation,
+            parent_permission=self.permission,
+            prior_results=prior_results,
+        )
+
+        self.replan_log.append({
+            "task_id": task.id,
+            "deviation": deviation.summary(),
+            "replan_success": replan_result.get("success", False),
+        })
+
+        return replan_result

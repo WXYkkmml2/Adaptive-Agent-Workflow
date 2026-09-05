@@ -195,6 +195,7 @@ TOOL_REGISTRY = {
         "device_types": {"bus"},
         "risk_level": "low",
         "requires_net_arg": True,  # 需要传入 net 参数
+        "allowed_params": {"bus_id"},
     },
     "get_neighbor_buses": {
         "func": get_neighbor_buses,
@@ -202,6 +203,7 @@ TOOL_REGISTRY = {
         "device_types": {"bus"},
         "risk_level": "low",
         "requires_net_arg": True,
+        "allowed_params": {"bus_id"},
     },
     "get_line_loading": {
         "func": get_line_loading,
@@ -209,6 +211,7 @@ TOOL_REGISTRY = {
         "device_types": {"line"},
         "risk_level": "low",
         "requires_net_arg": True,
+        "allowed_params": {"line_id"},
     },
     "get_generator_state": {
         "func": get_generator_state,
@@ -216,6 +219,7 @@ TOOL_REGISTRY = {
         "device_types": {"gen"},
         "risk_level": "low",
         "requires_net_arg": True,
+        "allowed_params": {"gen_id"},
     },
     "simulate_action": {
         "func": simulate_action,
@@ -223,6 +227,7 @@ TOOL_REGISTRY = {
         "device_types": {"bus", "line", "gen", "trafo"},
         "risk_level": "medium",
         "requires_net_arg": True,
+        "allowed_params": {"action"},
     },
     "check_constraints": {
         "func": check_constraints,
@@ -230,6 +235,33 @@ TOOL_REGISTRY = {
         "device_types": {"bus", "line"},
         "risk_level": "low",
         "requires_net_arg": True,
+        "allowed_params": set(),
+    },
+
+    # 写入修改类操作以便统一做参数名校验（实际执行可能在 ExecutionAgent 中直接调用 network 方法）
+    "set_gen_voltage": {
+        "func": None,
+        "description": "设置发电机电压设定值",
+        "device_types": {"gen"},
+        "risk_level": "medium",
+        "requires_net_arg": False,
+        "allowed_params": {"gen_id", "vm_pu"},
+    },
+    "set_gen_output": {
+        "func": None,
+        "description": "设置发电机有功出力",
+        "device_types": {"gen"},
+        "risk_level": "medium",
+        "requires_net_arg": False,
+        "allowed_params": {"gen_id", "p_mw"},
+    },
+    "set_line_status": {
+        "func": None,
+        "description": "设置线路的投入/退出状态",
+        "device_types": {"line"},
+        "risk_level": "high",
+        "requires_net_arg": False,
+        "allowed_params": {"line_id", "in_service"},
     },
 }
 
@@ -262,6 +294,27 @@ def get_available_tools(permission: dict = None) -> list:
     return available
 
 
+def validate_tool_params(tool_name: str, params: dict) -> tuple:
+    """
+    校验给定工具的参数名是否合法。
+
+    返回 (True, None) 或 (False, error_message)。
+    """
+    if tool_name not in TOOL_REGISTRY:
+        return False, f"工具 '{tool_name}' 不存在"
+
+    allowed = TOOL_REGISTRY[tool_name].get("allowed_params")
+    # 如果 allowed_params 是 None，视为不做校验（向后兼容）
+    if allowed is None:
+        return True, None
+
+    # 检查传入的参数名是否在白名单里
+    bad = [k for k in params.keys() if k not in allowed]
+    if bad:
+        return False, f"参数 {bad} 不存在，合法参数为 {sorted(list(allowed))}"
+    return True, None
+
+
 def call_tool(tool_name: str, net, **kwargs) -> dict:
     """
     统一的工具调用入口。
@@ -272,6 +325,17 @@ def call_tool(tool_name: str, net, **kwargs) -> dict:
         return {"success": False, "error": f"工具 '{tool_name}' 不存在"}
 
     func = TOOL_REGISTRY[tool_name]["func"]
+    # 参数名校验网关
+    allowed = TOOL_REGISTRY[tool_name].get("allowed_params")
+    if allowed is not None:
+        # kwargs 里除去 None 值外的参数名
+        bad = [k for k in kwargs.keys() if k not in allowed]
+        if bad:
+            return {
+                "success": False,
+                "tool": tool_name,
+                "error": f"参数 {bad} 不存在，合法参数为 {sorted(list(allowed))}",
+            }
     try:
         # 容错：如果传入的是 1-based 编号（例如用户/LLM 使用人类编号），
         # 自动尝试转换为 0-based 索引以匹配 pandapower 的表索引。

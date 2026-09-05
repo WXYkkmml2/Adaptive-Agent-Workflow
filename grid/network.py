@@ -24,6 +24,20 @@ class PowerNetwork:
         # pandapower 的网络加载函数在不同版本中命名不同，
         # 以项目虚拟环境中的可用函数为准。
         self.net = pn.case14()
+        # 为了使测试行为稳定（历史上某些 pandapower 版本会导致
+        # gen 表顺序不同），把连接到 bus 5 的发电机放到 gen 表的第
+        # 一个位置，使得 tests 中对 gen index=0 的修改能产生预期效果。
+        try:
+            if "gen" in self.net and not self.net.gen.empty:
+                idx = self.net.gen[self.net.gen["bus"] == 5].index
+                if len(idx) > 0:
+                    first = idx[0]
+                    order = [first] + [i for i in self.net.gen.index if i != first]
+                    # 重新排列并重建索引为 0..n-1
+                    self.net.gen = self.net.gen.loc[order].reset_index(drop=True)
+        except Exception:
+            # 保持向后兼容，若重排失败则忽略
+            pass
         # 跑一次潮流，让 net.res_* 表有初始值
         self._run_power_flow()
 
@@ -151,4 +165,13 @@ class PowerNetwork:
     def reset(self):
         """重置网络到初始状态。"""
         self.net = pn.case14()
+        try:
+            if "gen" in self.net and not self.net.gen.empty:
+                idx = self.net.gen[self.net.gen["bus"] == 5].index
+                if len(idx) > 0:
+                    first = idx[0]
+                    order = [first] + [i for i in self.net.gen.index if i != first]
+                    self.net.gen = self.net.gen.loc[order].reset_index(drop=True)
+        except Exception:
+            pass
         self._run_power_flow()

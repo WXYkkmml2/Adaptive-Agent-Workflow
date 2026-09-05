@@ -14,7 +14,7 @@ import logging
 import json
 import numpy as np
 from agents.permission import Permission
-from grid.tools import get_available_tools, call_tool, TOOL_REGISTRY
+from grid.tools import get_available_tools, call_tool, TOOL_REGISTRY, validate_tool_params
 from llm.client import LLMClient
 from llm.prompts import EXECUTION_SYSTEM, EXECUTION_USER
 from config.settings import TEMPERATURE_MIN, TEMPERATURE_MAX
@@ -238,17 +238,21 @@ class ExecutionAgent:
             # 对于修改类工具，直接在真实网络上操作
             # （在 MVP 中"真实网络"就是 pandapower 的 net 对象）
             if tool_name in ("set_gen_voltage", "set_gen_output", "set_line_status"):
-                # 调用 network 对象的方法修改真实网络
-                try:
-                    if tool_name == "set_gen_voltage":
-                        self.network.set_gen_voltage(**params)
-                    elif tool_name == "set_gen_output":
-                        self.network.set_gen_output(**params)
-                    elif tool_name == "set_line_status":
-                        self.network.set_line_status(**params)
-                    result = {"success": True, "tool": tool_name, "result": "操作已执行"}
-                except Exception as e:
-                    result = {"success": False, "tool": tool_name, "error": str(e)}
+                # 修改类操作：先校验参数名，再调用 network 方法修改真实网络
+                ok, err = validate_tool_params(tool_name, params)
+                if not ok:
+                    result = {"success": False, "tool": tool_name, "error": err}
+                else:
+                    try:
+                        if tool_name == "set_gen_voltage":
+                            self.network.set_gen_voltage(**params)
+                        elif tool_name == "set_gen_output":
+                            self.network.set_gen_output(**params)
+                        elif tool_name == "set_line_status":
+                            self.network.set_line_status(**params)
+                        result = {"success": True, "tool": tool_name, "result": "操作已执行"}
+                    except Exception as e:
+                        result = {"success": False, "tool": tool_name, "error": str(e)}
             else:
                 # 查询类工具通过统一入口调用
                 result = call_tool(tool_name, self.network.net, **params)

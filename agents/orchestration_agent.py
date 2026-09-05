@@ -1,19 +1,13 @@
 """
-S2 编排智能体。
-
-对应原文档：
-"编排智能体接受任务，根据权限进行剪枝，
- 然后编排会去二次调用大模型，在约束拓扑子图上进行细化任务。"
-
-关键行为取决于是否为最后编排层：
-- 是最后编排层 → 输出设备级执行语义（设备ID、操作类型、参数值）
-- 不是 → 继续拆子任务，实例化下一层编排智能体
+S2 编排智能体。（Step 3 更新：加入偏差检测 + 重规划支持）
 """
 
+import json
 import logging
 from agents.task import Task
 from agents.permission import Permission
 from agents.execution_agent import ExecutionAgent
+from agents.deviation import detect_deviation
 from llm.client import LLMClient
 from llm.prompts import ORCHESTRATION_SYSTEM, ORCHESTRATION_USER
 from grid.tools import get_available_tools
@@ -24,22 +18,10 @@ logger = logging.getLogger(__name__)
 class OrchestrationAgent:
     """
     编排智能体。
-
-    每个编排智能体负责一个任务的细化：
-    加载权限 → 裁剪搜索空间 → 调用 LLM 细化 → 实例化下一层
-
-    参数:
-        agent_id: 智能体标识（如 "orch_1_t1" 表示第 1 层负责 t1 的编排）
-        task: 分配给该智能体的任务
-        permission: 该智能体的权限三元组（已和父智能体取交集）
-        network: 电网对象
-        llm: LLM 客户端
-        current_depth: 当前所在层级（根=0, 第一编排层=1, ...）
-        max_depth: 最大深度 H（执行层在 H-1）
-        prior_results: 前置任务的结果（供上下文使用）
-        anti_example_store: 反例库（传给执行智能体用）
-        d0_info: D0 相关信息（传给执行智能体用）
-        certainty: 确定性指标 C（传给执行智能体用）
+    
+    Step 3 新增：
+    - 偏差检测：执行智能体回传后，对比预期状态
+    - 重规划标记：如果是重规划实例，LLM prompt 中附带失败上下文
     """
 
     def __init__(
@@ -55,6 +37,8 @@ class OrchestrationAgent:
         anti_example_store=None,
         d0_info: dict = None,
         certainty: float = 0.7,
+        is_replan: bool = False,       # ← Step 3 新增
+        failure_info: dict = None,     # ← Step 3 新增
     ):
         self.agent_id = agent_id
         self.task = task
@@ -67,52 +51,30 @@ class OrchestrationAgent:
         self.anti_example_store = anti_example_store
         self.d0_info = d0_info or {}
         self.certainty = certainty
+        self.is_replan = is_replan
+        self.failure_info = failure_info or {}
 
     @property
     def is_last_orchestration_layer(self) -> bool:
-        """
-        判断当前是否为最后编排层。
-        
-        如果是最后编排层，LLM 需要输出设备级指令；
-        否则继续拆子任务给下一层编排。
-        
-        树结构（以 H=4 为例）：
-          depth 0: 根
-          depth 1: 编排01
-          depth 2: 编排02 ← 最后编排层（下一层是执行层 depth 3 = H-1）
-          depth 3: 执行
-        
-        所以最后编排层的 current_depth == max_depth - 2
-        """
         return self.current_depth >= self.max_depth - 2
 
     def execute(self) -> dict:
-        """
-        执行编排流程：
-
-        1. 根据权限裁剪可用工具（模拟拓扑裁剪）
-        2. 调用 LLM 细化任务
-        3a. 如果是最后编排层 → 实例化执行智能体
-        3b. 如果不是 → 实例化下一层编排智能体
-        4. 收集子智能体结果，回传给父
-        """
+        indent = "  " * self.current_depth
+        replan_tag = " [重规划]" if self.is_replan else ""
         logger.info(
-            f"{'  ' * self.current_depth}[{self.agent_id}] "
+            f"{indent}[{self.agent_id}]{replan_tag} "
             f"编排层 depth={self.current_depth}, "
             f"任务: {self.task.description}"
         )
 
         # ---- 1. 权限裁剪 ----
-        # 根据权限过滤可用工具，模拟"在约束拓扑子图上"操作
         available_tools = get_available_tools(self.permission.to_dict())
         logger.info(
-            f"{'  ' * self.current_depth}  可用工具({len(available_tools)}): "
-            f"{available_tools}"
+            f"{indent}  可用工具({len(available_tools)}): {available_tools}"
         )
 
         # ---- 2. 调用 LLM 细化任务 ----
         instructions = self._call_llm_decompose(available_tools)
-
         if not instructions:
             return {
                 "agent_id": self.agent_id,
@@ -123,57 +85,63 @@ class OrchestrationAgent:
 
         # ---- 3. 分发到下一层 ----
         if self.is_last_orchestration_layer:
-            # 最后编排层 → 实例化执行智能体
-            return self._dispatch_to_execution(instructions)
+            result = self._dispatch_to_execution(instructions)
         else:
-            # 非最后编排层 → 实例化下一层编排智能体
-            return self._dispatch_to_next_orchestration(instructions)
+            result = self._dispatch_to_next_orchestration(instructions)
+
+        # ---- 4. 偏差检测（Step 3 新增） ----
+        # 对应原文档：
+        # "编排智能体拿回传数据和自己保留的预期做比对，
+        #  发现对不上就生成偏差特征。"
+        if result.get("success", False):
+            deviation = self._check_deviation(result, instructions)
+            if deviation is not None:
+                logger.warning(
+                    f"{indent}  ⚠ 检测到偏差: {deviation.summary()}"
+                )
+                result["success"] = False
+                result["deviation"] = deviation
+                result["error"] = deviation.description
+
+        return result
 
     def _call_llm_decompose(self, available_tools: list) -> list:
-        """
-        调用 LLM 将任务细化。
+        """调用 LLM 细化任务，重规划时附带失败上下文。"""
 
-        对应原文档：
-        "编排智能体把设备级任务和约束拓扑子图输入大模型"
-        """
         system_prompt = ORCHESTRATION_SYSTEM.format(
             permission=self.permission.to_dict(),
             available_devices=self.task.devices,
         )
 
+        # 构建用户 prompt
+        prior = str(self.prior_results)
+
+        # ---- Step 3 新增：重规划时附带失败信息 ----
+        if self.is_replan and self.failure_info:
+            prior += (
+                f"\n\n【注意：这是重规划。上次失败信息如下】\n"
+                f"失败类型: {self.failure_info.get('previous_failure', {}).get('type', '未知')}\n"
+                f"失败描述: {self.failure_info.get('previous_failure', {}).get('description', '无')}\n"
+                f"建议: {self.failure_info.get('replan_guidance', '请重新分析')}\n"
+            )
+
         user_prompt = ORCHESTRATION_USER.format(
             task_description=self.task.description,
             devices=self.task.devices,
-            prior_results=str(self.prior_results),
+            prior_results=prior,
         )
-
-        # 调试输出：记录发送给 LLM 的 prompt（便于定位解析错误）
-        logger.debug(f"System prompt:\n{system_prompt}")
-        logger.debug(f"User prompt:\n{user_prompt}")
 
         response = self.llm.complete_json(system_prompt, user_prompt)
         return response.get("instructions", [])
 
     def _dispatch_to_execution(self, instructions: list) -> dict:
-        """
-        实例化执行智能体并收集结果。
-
-        对应原文档：
-        "编排智能体把当前任务拆成多个互不依赖的执行级子任务，
-         就分别实例化多个并列执行智能体"
-        """
         results = []
-
         for i, inst in enumerate(instructions):
             exec_id = f"exec_{self.task.id}_{i}"
-
-            # 为执行智能体生成权限（和当前编排智能体取交集）
-            exec_permission = self.permission  # 执行层继承编排层权限
-
             exec_agent = ExecutionAgent(
                 agent_id=exec_id,
                 instruction=inst,
-                permission=exec_permission,
+                permission=self.permission,
                 network=self.network,
                 llm=self.llm,
                 anti_example_store=self.anti_example_store,
@@ -181,33 +149,23 @@ class OrchestrationAgent:
                 certainty=self.certainty,
                 depth=self.current_depth + 1,
             )
-
             result = exec_agent.execute()
             results.append(result)
 
-        # 汇总结果回传
         all_success = all(r.get("success", False) for r in results)
         return {
             "agent_id": self.agent_id,
             "task_id": self.task.id,
             "success": all_success,
             "execution_results": results,
-            # 编排智能体保留预期状态，用于 S4 偏差检测
-            "expected_results": [inst.get("expected_result", "") for inst in instructions],
+            "expected_results": [
+                inst.get("expected_result", "") for inst in instructions
+            ],
         }
 
     def _dispatch_to_next_orchestration(self, instructions: list) -> dict:
-        """
-        实例化下一层编排智能体。
-
-        对应原文档（4 层示例）：
-        "编排01 的智能体 A 把 t1 细化为 t1a 和 t1b，
-         因为当前层不是最后编排层，向编排02 层分别实例化智能体 B 和 C"
-        """
         results = []
-
         for i, inst in enumerate(instructions):
-            # 把指令包装成子任务
             sub_task = Task(
                 id=f"{self.task.id}_sub{i}",
                 description=inst.get("description", ""),
@@ -215,10 +173,7 @@ class OrchestrationAgent:
                 device_type=self.task.device_type,
                 voltage_level=self.task.voltage_level,
             )
-
             child_id = f"orch_{self.current_depth + 1}_{sub_task.id}"
-
-            # 子编排智能体的权限 = 当前权限 ∩ 子任务所需权限
             child_required = Permission.from_task(sub_task)
             child_permission = self.permission.intersect(child_required)
 
@@ -234,8 +189,9 @@ class OrchestrationAgent:
                 anti_example_store=self.anti_example_store,
                 d0_info=self.d0_info,
                 certainty=self.certainty,
+                is_replan=self.is_replan,
+                failure_info=self.failure_info,
             )
-
             result = child_agent.execute()
             results.append(result)
 
@@ -246,3 +202,44 @@ class OrchestrationAgent:
             "success": all_success,
             "child_results": results,
         }
+
+    def _check_deviation(self, result: dict, instructions: list) -> "Deviation | None":
+        """
+        S4 偏差检测。
+        
+        对应原文档：
+        "父编排智能体知道自己下发了什么指令、预期结果应该是什么，
+         它拿回传数据和预期做对比。"
+        """
+        exec_results = result.get("execution_results", [])
+        if not exec_results:
+            exec_results = result.get("child_results", [])
+
+        # 收集所有子结果中的工具执行结果（可能嵌套）
+        flat_results = self._flatten_results(exec_results)
+
+        expected_desc = "; ".join(
+            inst.get("expected_result", "") for inst in instructions
+        )
+
+        return detect_deviation(
+            task_id=self.task.id,
+            expected_description=expected_desc,
+            execution_results=flat_results,
+            agent_path=[self.agent_id],
+            network=self.network,
+        )
+
+    def _flatten_results(self, results: list) -> list:
+        """递归展开嵌套的执行结果。"""
+        flat = []
+        for r in results:
+            if "tool_results" in r:
+                flat.extend(r["tool_results"])
+            elif "execution_results" in r:
+                flat.extend(self._flatten_results(r["execution_results"]))
+            elif "child_results" in r:
+                flat.extend(self._flatten_results(r["child_results"]))
+            else:
+                flat.append(r)
+        return flat
