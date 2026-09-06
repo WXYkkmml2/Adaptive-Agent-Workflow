@@ -75,8 +75,9 @@ class Permission:
         device_types = set()
         if task.device_type:
             device_types.add(task.device_type)
-        # 工具调用可能涉及多种设备
-        device_types.update({"bus", "line"})  # 查询类工具几乎都需要
+        # 允许任务所需的常见分析/执行工具在同一权限范围内可用。
+        # 这包括 bus/line/gen/trafo 的查询与仿真工具，避免在 S3 中被误判为“工具不在权限中”。
+        device_types.update({"bus", "line", "gen", "trafo"})
 
         return Permission(
             regions={"ieee14"},

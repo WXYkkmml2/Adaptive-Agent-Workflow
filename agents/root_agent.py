@@ -83,27 +83,31 @@ class RootAgent:
                     self.dag.update_status(task.id, TaskStatus.COMPLETED, result)
                     logger.info(f"[根智能体] ✓ 任务 {task.id} 完成")
                 else:
-                    # ---- Step 3: S4 重规划 ----
-                    logger.warning(f"[根智能体] ✗ 任务 {task.id} 失败，启动 S4")
                     replan_result = self._handle_task_failure(task, result)
 
-                    if replan_result.get("success", False):
-                        self.dag.update_status(
-                            task.id, TaskStatus.COMPLETED, replan_result
-                        )
-                        logger.info(
-                            f"[根智能体] ✓ 任务 {task.id} 重规划后成功"
-                        )
-                    elif replan_result.get("needs_human", False):
+                    if replan_result.get("llm_error"):
+                        logger.warning(f"[根智能体] 任务失败：LLM/API错误，不触发S4 ({task.id})")
                         self.dag.update_status(task.id, TaskStatus.FAILED, replan_result)
-                        logger.error(
-                            f"[根智能体] ⚠ 任务 {task.id} 需要人工介入"
-                        )
                     else:
-                        self.dag.update_status(task.id, TaskStatus.FAILED, replan_result)
-                        logger.error(
-                            f"[根智能体] ✗ 任务 {task.id} 重规划失败"
-                        )
+                        # ---- Step 3: S4 重规划 ----
+                        logger.warning(f"[根智能体] ✗ 任务 {task.id} 失败，启动 S4")
+                        if replan_result.get("success", False):
+                            self.dag.update_status(
+                                task.id, TaskStatus.COMPLETED, replan_result
+                            )
+                            logger.info(
+                                f"[根智能体] ✓ 任务 {task.id} 重规划后成功"
+                            )
+                        elif replan_result.get("needs_human", False):
+                            self.dag.update_status(task.id, TaskStatus.FAILED, replan_result)
+                            logger.error(
+                                f"[根智能体] ⚠ 任务 {task.id} 需要人工介入"
+                            )
+                        else:
+                            self.dag.update_status(task.id, TaskStatus.FAILED, replan_result)
+                            logger.error(
+                                f"[根智能体] ✗ 任务 {task.id} 重规划失败"
+                            )
 
                 self.execution_log.append({
                     "task_id": task.id,
@@ -172,7 +176,6 @@ class RootAgent:
         deviation = result.get("deviation")
 
         if deviation is None:
-            # 没有结构化偏差信息，构造一个通用的
             deviation = Deviation(
                 deviation_type=DeviationType.INSUFFICIENT,
                 description=result.get("error", "任务执行失败"),
@@ -181,14 +184,35 @@ class RootAgent:
                 task_id=task.id,
             )
 
-        # 收集前置任务结果
+        failure_text = f"{deviation.description} {deviation.actual}".lower()
+        llm_markers = [
+            "llm_error",
+            "llm",
+            "api",
+            "json",
+            "解析失败",
+            "网络错误",
+            "连接失败",
+            "请求失败",
+            "无法解析",
+        ]
+        if any(marker in failure_text for marker in llm_markers):
+            logger.warning(f"[根智能体] 识别到 LLM/API 失败，不触发 S4 重规划: {deviation.summary()}")
+            return {
+                "success": False,
+                "task_id": task.id,
+                "error": "LLM/API 请求失败，不触发 S4 重规划",
+                "needs_human": False,
+                "llm_error": True,
+                "deviation": deviation.summary(),
+            }
+
         prior_results = {}
         for dep_id in task.dependencies:
             dep_task = self.dag.tasks.get(dep_id)
             if dep_task and dep_task.result:
                 prior_results[dep_id] = dep_task.result
 
-        # 调用重规划器
         replan_result = self.replanner.handle_failure(
             task=task,
             deviation=deviation,

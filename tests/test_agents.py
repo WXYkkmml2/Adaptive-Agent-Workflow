@@ -119,3 +119,39 @@ def test_execution_log(setup):
     result = root.execute()
     assert len(root.execution_log) > 0
     assert all("task_id" in entry for entry in root.execution_log)
+
+
+def test_execution_agent_rejects_invalid_tool_without_llm():
+    """ExecutionAgent 无法在当前权限下执行工具时，应直接失败，不再调用 LLM。"""
+    network = PowerNetwork()
+    llm = MockLLMClient()
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("ExecutionAgent 不应再次调用 LLM")
+
+    llm.complete_json = fail_if_called
+
+    agent = Permission.root_permission()
+    execution = __import__("agents.execution_agent", fromlist=["ExecutionAgent"]).ExecutionAgent(
+        agent_id="exec_invalid",
+        instruction={"tool": "nonexistent_tool", "params": {"bus_id": 1}, "description": "非法工具"},
+        permission=agent,
+        network=network,
+        llm=llm,
+    )
+
+    result = execution.execute()
+    assert result["success"] is False
+    assert result["error"]
+    assert "工具" in result["error"] or "权限" in result["error"]
+
+
+def test_llm_complete_json_returns_structured_error_on_bad_json():
+    """LLM JSON 解析失败时必须返回显式 LLM_ERROR，不是空字典。"""
+    class BrokenClient(__import__("llm.client", fromlist=["LLMClient"]).LLMClient):
+        def complete(self, system_prompt, user_prompt, temperature=0.7):
+            return '{not valid json}'
+
+    result = BrokenClient().complete_json("system", "user")
+    assert result.get("error") == "LLM_ERROR"
+    assert "json" in str(result.get("message", "")).lower()

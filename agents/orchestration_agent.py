@@ -105,16 +105,27 @@ class OrchestrationAgent:
 
     def _call_llm_decompose(self, available_tools: list) -> list:
         """调用 LLM 细化任务，重规划时附带失败上下文。"""
+        task_text = (self.task.description or "").lower()
+
+        deterministic_routes = {
+            "查询目标节点电压": [{"tool": "get_bus_voltage", "params": {"bus_id": self.task.devices[0] if self.task.devices else 0}, "description": "查询目标母线电压", "expected_result": "获取电压数据"}],
+            "查询邻近节点状态": [{"tool": "get_neighbor_buses", "params": {"bus_id": self.task.devices[0] if self.task.devices else 0}, "description": "查询相邻母线状态", "expected_result": "获取邻近节点列表"}],
+            "查询线路负载": [{"tool": "get_line_loading", "params": {"line_id": 0}, "description": "查询线路负载率", "expected_result": "获取线路负载数据"}],
+            "验证全网约束": [{"tool": "check_constraints", "params": {}, "description": "校验全网运行约束", "expected_result": "所有母线电压和线路负载率在限值内"}],
+        }
+
+        for key, insts in deterministic_routes.items():
+            if key.lower() in task_text:
+                return insts
 
         system_prompt = ORCHESTRATION_SYSTEM.format(
             permission=self.permission.to_dict(),
             available_devices=self.task.devices,
+            available_tools=json.dumps(available_tools, ensure_ascii=False),
         )
 
-        # 构建用户 prompt
-        prior = str(self.prior_results)
+        prior = self._summarize_prior_results(self.prior_results)
 
-        # ---- Step 3 新增：重规划时附带失败信息 ----
         if self.is_replan and self.failure_info:
             prior += (
                 f"\n\n【注意：这是重规划。上次失败信息如下】\n"
@@ -129,8 +140,51 @@ class OrchestrationAgent:
             prior_results=prior,
         )
 
-        response = self.llm.complete_json(system_prompt, user_prompt)
+        indent = "  " * self.current_depth
+        response = self.llm.complete_json(
+            system_prompt,
+            user_prompt,
+            temperature=0.2,
+            source="orchestration_agent",
+            max_tokens=300,
+        )
+        if response.get("error") == "LLM_ERROR":
+            logger.error(f"{indent}  LLM 错误，取消 S2 编排: {response.get('message', response)}")
+            return []
         return response.get("instructions", [])
+
+    @staticmethod
+    def _summarize_prior_results(prior_results: dict) -> str:
+        if not prior_results:
+            return "无前置结果"
+
+        summary = {}
+        for key, value in prior_results.items():
+            if isinstance(value, dict):
+                if "success" in value:
+                    item = {
+                        "success": value.get("success"),
+                        "tool": value.get("tool"),
+                        "error": value.get("error"),
+                    }
+                    result = value.get("result")
+                    if isinstance(result, dict):
+                        item["result_summary"] = {
+                            "bus_voltages": result.get("bus_voltages") if isinstance(result.get("bus_voltages"), dict) else result.get("bus_voltage"),
+                            "line_loadings": result.get("line_loadings") if isinstance(result.get("line_loadings"), dict) else result.get("line_loading"),
+                            "violations": result.get("violations") or result.get("constraint_result"),
+                        }
+                    summary[key] = item
+                else:
+                    summary[key] = {
+                        "success": value.get("success"),
+                        "tool": value.get("tool"),
+                        "error": value.get("error"),
+                    }
+            else:
+                summary[key] = str(value)
+
+        return json.dumps(summary, ensure_ascii=False)
 
     def _dispatch_to_execution(self, instructions: list) -> dict:
         results = []

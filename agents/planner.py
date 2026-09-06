@@ -140,7 +140,13 @@ class Planner:
         )
 
         # 调用 LLM
-        response = self.llm.complete_json(PLANNER_SYSTEM, user_prompt, temperature=0.7)
+        response = self.llm.complete_json(
+            PLANNER_SYSTEM,
+            user_prompt,
+            temperature=0.2,
+            source="planner",
+            max_tokens=600,
+        )
 
         # 解析为 TaskDAG
         dag = TaskDAG()

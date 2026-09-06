@@ -54,10 +54,13 @@ class ExecutionAgent:
         logger.info(f"{indent}[{self.agent_id}] 执行: {self.instruction.get('description', '')}")
 
         tool_plan = self._plan_tool_calls()
-        if not tool_plan:
-            return self._fail("无法生成工具调用计划")
+        if not tool_plan.get("success", True) is not False:
+            return self._fail(tool_plan.get("error", "无法生成工具调用计划"))
 
         tool_sequence = tool_plan.get("tool_sequence", [])
+        if not tool_sequence:
+            return self._fail("工具调用序列为空")
+
         strategy = tool_plan.get("strategy", "direct")
 
         temperature = self._compute_temperature()
@@ -75,39 +78,37 @@ class ExecutionAgent:
 
     def _plan_tool_calls(self) -> dict:
         """
-        01 调用大模型生成工具调用序列。
-
-        这里可以直接用编排层已经给出的 tool + params，
-        也可以再调一次 LLM 让它选择更优的序列。
-        MVP 中优先使用编排层的指令（如果已经足够具体）。
+        使用编排层已经给出的 tool + params，禁止再次调用 LLM。
+        若 tool 不存在或不在当前权限范围内，直接返回结构化失败。
         """
         tool_name = self.instruction.get("tool", "")
         params = self.instruction.get("params", {})
+        available = get_available_tools(self.permission.to_dict())
 
-        if tool_name and tool_name in TOOL_REGISTRY:
-            # 编排层已经给出了具体的工具调用，直接用
-            # 根据工具的风险等级确定执行策略
-            risk = TOOL_REGISTRY[tool_name]["risk_level"]
-            strategy_map = {"low": "direct", "medium": "simulate", "high": "human"}
+        if not tool_name:
+            return {"success": False, "error": "指令缺少 tool 字段"}
+
+        if tool_name not in TOOL_REGISTRY:
+            return {"success": False, "error": f"工具 '{tool_name}' 不存在", "available_tools": available}
+
+        if tool_name not in available:
             return {
-                "tool_sequence": [{"tool": tool_name, "params": params}],
-                "strategy": strategy_map.get(risk, "simulate"),
+                "success": False,
+                "error": f"工具 '{tool_name}' 不在当前权限对应的 available_tools 中",
+                "available_tools": available,
             }
 
-        # 编排层没给具体工具，需要调 LLM 选择
-        available = get_available_tools(self.permission.to_dict())
-        tools_desc = {
-            name: TOOL_REGISTRY[name]["description"]
-            for name in available
+        ok, err = validate_tool_params(tool_name, params, context=self.instruction.get("description", ""))
+        if not ok:
+            return {"success": False, "error": f"参数校验失败: {err}", "available_tools": available}
+
+        risk = TOOL_REGISTRY[tool_name]["risk_level"]
+        strategy_map = {"low": "direct", "medium": "simulate", "high": "human"}
+        return {
+            "success": True,
+            "tool_sequence": [{"tool": tool_name, "params": params}],
+            "strategy": strategy_map.get(risk, "simulate"),
         }
-
-        system_prompt = EXECUTION_SYSTEM.format(tools=json.dumps(tools_desc, ensure_ascii=False))
-        user_prompt = EXECUTION_USER.format(
-            instruction=json.dumps(self.instruction, ensure_ascii=False),
-            context=str(self.d0_info),
-        )
-
-        return self.llm.complete_json(system_prompt, user_prompt)
 
     def _compute_temperature(self) -> float:
         """

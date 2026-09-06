@@ -44,13 +44,8 @@ class Replanner:
         """
         处理一个失败任务的完整 S4 流程。
 
-        对应原文档的三种情况：
-        1. 失效在执行层 → 用同样指令重走 S3
-        2. 失效在编排层 → 重新拆解（带失败上下文）
-        3. 失效在更上层 → 从更上层重建子树
-
-        MVP 简化为：所有情况都从编排层重新拆解，
-        因为编排层会带着失败上下文重新调用 LLM。
+        只在真实物理异常或业务偏差下触发重规划；
+        API 超时、LLM 请求失败、JSON 格式错误不触发 S4。
         """
         if attempt > MAX_REPLAN_ATTEMPTS:
             logger.error(
@@ -64,24 +59,26 @@ class Replanner:
                 "needs_human": True,
             }
 
+        if self._is_llm_or_api_failure(deviation):
+            logger.warning(f"[重规划] 识别到 LLM/API 错误，不触发重规划: {deviation.summary()}")
+            return {
+                "success": False,
+                "task_id": task.id,
+                "error": "LLM/API 错误，不触发 S4 重规划",
+                "needs_human": False,
+                "llm_error": True,
+            }
+
         logger.info(
             f"\n[重规划] 任务 {task.id} 第 {attempt} 次重规划"
             f"\n  偏差类型: {deviation.deviation_type.value}"
             f"\n  偏差描述: {deviation.description}"
         )
 
-        # ---- 1. 判断处理方式 ----
-        # 对应原文档：
-        # "权限越界 → 回到上层重新拆解
-        #  违反物理约束 → 回到编排层重规划
-        #  参数有效性 → 回到 S3 重新调 LLM
-        #  工具接口故障 → 等待或切换备用"
         if deviation.deviation_type == DeviationType.TOOL_FAULT:
             logger.info("[重规划] 工具故障，等待后重试")
-            # MVP 中直接重试，生产中应等待/切换
-            pass  # 下面统一走重新编排
+            pass
 
-        # ---- 3. 构建失败上下文 ----
         failure_context = self._build_failure_context(task, deviation, prior_results)
 
         # ---- 4. 在失效节点重新实例化编排智能体 ----
@@ -145,6 +142,26 @@ class Replanner:
 
         return orch_agent.execute()
 
+    @staticmethod
+    def _is_llm_or_api_failure(deviation: Deviation) -> bool:
+        text = f"{deviation.description} {deviation.actual}".lower()
+        llm_markers = [
+            "llm_error",
+            "llm",
+            "api",
+            "json",
+            "解析失败",
+            "网络错误",
+            "连接失败",
+            "无法解析",
+            "请求失败",
+        ]
+        if any(marker in text for marker in llm_markers):
+            return True
+
+        # 仅在与 LLM/API 直接相关的超时场景下忽略 S4；通用工具超时仍允许重规划。
+        return "timeout" in text and any(marker in text for marker in ["llm", "api", "openai", "http", "request"])
+
     def _build_failure_context(
         self, task: Task, deviation: Deviation, prior_results: dict = None
     ) -> dict:
@@ -153,6 +170,18 @@ class Replanner:
 
         这些信息让 LLM 在重新拆解时避开上次的错误。
         """
+        safe_prior = {}
+        for key, value in (prior_results or {}).items():
+            if isinstance(value, dict):
+                safe_prior[key] = {
+                    "success": value.get("success"),
+                    "tool": value.get("tool"),
+                    "error": value.get("error"),
+                    "result_summary": self._summarize_result(value.get("result")),
+                }
+            else:
+                safe_prior[key] = str(value)
+
         return {
             "is_replan": True,
             "previous_failure": {
@@ -161,9 +190,21 @@ class Replanner:
                 "expected": deviation.expected,
                 "actual": deviation.actual,
             },
-            "prior_task_results": prior_results or {},
+            "prior_task_results": safe_prior,
             "replan_guidance": self._get_guidance(deviation),
         }
+
+    @staticmethod
+    def _summarize_result(result):
+        if not isinstance(result, dict):
+            return str(result)[:200] if result is not None else None
+        summary = {}
+        for key in ["bus_voltages", "line_loadings", "violations", "constraint_result", "all_satisfied", "violation_count"]:
+            if key in result:
+                summary[key] = result[key]
+        if not summary and "vm_pu" in result:
+            summary["vm_pu"] = result["vm_pu"]
+        return summary
 
     def _get_guidance(self, deviation: Deviation) -> str:
         """

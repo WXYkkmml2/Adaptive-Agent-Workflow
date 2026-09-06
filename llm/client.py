@@ -15,18 +15,34 @@ logger = logging.getLogger(__name__)
 
 
 class LLMClient:
-    def complete(self, system_prompt: str, user_prompt: str, temperature: float = 0.7) -> str:
+    def complete(self, system_prompt: str, user_prompt: str, temperature: float = 0.7, source: str = "unknown", max_tokens: int = None) -> str:
         raise NotImplementedError
 
-    def complete_json(self, system_prompt: str, user_prompt: str, temperature: float = 0.7) -> dict:
-        raw = self.complete(system_prompt, user_prompt, temperature)
-        cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+    def complete_json(self, system_prompt: str, user_prompt: str, temperature: float = 0.7, source: str = "unknown", max_tokens: int = None) -> dict:
+        try:
+            raw = self.complete(system_prompt, user_prompt, temperature, source=source, max_tokens=max_tokens)
+        except TypeError:
+            try:
+                raw = self.complete(system_prompt, user_prompt, temperature, source=source)
+            except TypeError:
+                raw = self.complete(system_prompt, user_prompt, temperature)
+
+        if isinstance(raw, dict):
+            if raw.get("error") == "LLM_ERROR":
+                return raw
+            return raw
+
+        cleaned = re.sub(r"^```(?:json)?\s*", "", str(raw).strip())
         cleaned = re.sub(r"\s*```$", "", cleaned)
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError as e:
-            logger.error(f"JSON 解析失败: {e}\n原始响应: {raw}")
-            return {}
+            logger.error(f"[LLM] JSON 解析失败: {e}\n原始响应: {raw}")
+            return {
+                "error": "LLM_ERROR",
+                "message": f"LLM JSON 解析失败: {e}",
+                "source": source,
+            }
 
 
 class MockLLMClient(LLMClient):
@@ -47,7 +63,7 @@ class MockLLMClient(LLMClient):
             f"使用 MockLLMClient（failure_mode={failure_mode}）"
         )
 
-    def complete(self, system_prompt: str, user_prompt: str, temperature: float = 0.7) -> str:
+    def complete(self, system_prompt: str, user_prompt: str, temperature: float = 0.7, source: str = "unknown", max_tokens: int = None) -> str:
         if "任务分解专家" in system_prompt:
             return self._planner_response(user_prompt)
         elif "编排智能体" in system_prompt:
@@ -240,21 +256,24 @@ class RealLLMClient(LLMClient):
             logger.info("检测到并清洗了环境中的 LLM_API_KEY（可能包含不合法引号或空白）")
         logger.info(f"使用 RealLLMClient: model={self.model}")
 
-    def complete(self, system_prompt: str, user_prompt: str, temperature: float = 0.7) -> str:
+    def complete(self, system_prompt: str, user_prompt: str, temperature: float = 0.7, source: str = "unknown", max_tokens: int = None) -> str:
         import urllib.request
         import urllib.error
         from llm.ssl_utils import get_ssl_context
         import time
         import socket
 
-        payload = json.dumps({
+        payload_obj = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "temperature": temperature,
-        })
+            "temperature": min(max(float(temperature), 0.1), 0.2),
+        }
+        if max_tokens is not None:
+            payload_obj["max_tokens"] = int(max_tokens)
+        payload = json.dumps(payload_obj)
 
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions",
@@ -265,16 +284,20 @@ class RealLLMClient(LLMClient):
             },
         )
 
-        # 可通过环境变量在开发/CI 环境下控制超时与重试次数，避免长时间阻塞
         try:
-            max_retries = int(os.environ.get("LLM_MAX_RETRIES", "3"))
+            max_retries = int(os.environ.get("LLM_MAX_RETRIES", "1"))
         except Exception:
-            max_retries = 3
+            max_retries = 1
         try:
-            base_timeout = int(os.environ.get("LLM_TIMEOUT", "120"))
+            base_timeout = int(os.environ.get("LLM_TIMEOUT", "20"))
         except Exception:
-            base_timeout = 120
+            base_timeout = 20
+
+        logger.info(f"[LLM] start: source={source}, model={self.model}, timeout={base_timeout}s, retries={max_retries}")
+        start_time = time.perf_counter()
+
         for attempt in range(1, max_retries + 1):
+            attempt_start = time.perf_counter()
             try:
                 context = get_ssl_context()
                 if context is not None:
@@ -285,19 +308,30 @@ class RealLLMClient(LLMClient):
                         raw = resp.read().decode("utf-8")
 
                 data = json.loads(raw)
-                return data["choices"][0]["message"]["content"]
+                content = data["choices"][0]["message"]["content"]
+                elapsed = time.perf_counter() - start_time
+                logger.info(f"[LLM] success: source={source}, attempt={attempt}/{max_retries}, elapsed={elapsed:.2f}s")
+                return content
 
             except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
-                logger.warning(f"LLM API 调用（尝试 {attempt}/{max_retries}）失败: {e}")
+                elapsed = time.perf_counter() - attempt_start
+                logger.warning(f"[LLM] failure: source={source}, attempt={attempt}/{max_retries}, elapsed={elapsed:.2f}s, error={e}")
                 if attempt < max_retries:
-                    time.sleep(2 ** (attempt - 1))
                     continue
-                else:
-                    logger.error(f"LLM API 调用最终失败: {e}")
-                    return "{}"
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.error(f"LLM 响应解析失败: {e}\n原始响应（截断）: {raw[:1000]}")
-                return "{}"
+                err_msg = f"LLM API 网络错误/超时: {e}"
+                logger.error(f"[LLM] final_error: source={source}, elapsed={time.perf_counter() - start_time:.2f}s, error={err_msg}")
+                return json.dumps({"error": "LLM_ERROR", "message": err_msg, "source": source}, ensure_ascii=False)
+
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                elapsed = time.perf_counter() - attempt_start
+                raw_excerpt = raw[:1000] if 'raw' in locals() else "<empty>"
+                logger.error(f"[LLM] parse_error: source={source}, attempt={attempt}/{max_retries}, elapsed={elapsed:.2f}s, error={e}, raw={raw_excerpt}")
+                err_msg = f"LLM JSON 解析失败: {e}"
+                return json.dumps({"error": "LLM_ERROR", "message": err_msg, "source": source}, ensure_ascii=False)
+
+        elapsed = time.perf_counter() - start_time
+        logger.error(f"[LLM] exhausted: source={source}, elapsed={elapsed:.2f}s, retries={max_retries}")
+        return json.dumps({"error": "LLM_ERROR", "message": "LLM 调用失败且重试耗尽", "source": source}, ensure_ascii=False)
 
 
 def create_llm_client(failure_mode: bool = False) -> LLMClient:
