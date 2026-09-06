@@ -1,21 +1,15 @@
 """
 S4 失效定位与子树重规划。
 
-"只是重规划失效的路径，其他的不动。
- 重规划是在失效的路径上递归新的实例的子编排智能体，
- 重新拆解相关的任务、调用顺序、修正调用的参数。"
-
-"重规划时新实例化的编排智能体在调用大模型的时候，
- 可以把前一次的失败信息（偏差特征、失效原因）作为上下文一起输入大模型，
- 让大模型在重新拆解的时候避开上次的错误。"
+重规划是在失效路径上重新实例化编排智能体，
+重新拆解相关任务并修正调用参数。
 """
 
 import logging
-from agents.task import Task, TaskDAG, TaskStatus
+from agents.task import Task
 from agents.deviation import Deviation, DeviationType
 from agents.permission import Permission
 from agents.orchestration_agent import OrchestrationAgent
-from agents.anti_example import AntiExampleStore, FailureCase
 from llm.client import LLMClient
 from config.settings import MAX_REPLAN_ATTEMPTS
 
@@ -23,28 +17,18 @@ logger = logging.getLogger(__name__)
 
 
 class Replanner:
-    """
-    S4 重规划器。
-
-    职责：
-    1. 根据偏差特征判断失效层级
-    2. 在失效节点位置实例化新的智能体
-    3. 将失败信息作为上下文传给新智能体
-    4. 将失败案例存入反例库
-    """
+    """S4 重规划器。"""
 
     def __init__(
         self,
         network,
         llm: LLMClient,
-        anti_example_store: AntiExampleStore,
         d0_info: dict,
         certainty: float,
         tree_depth: int,
     ):
         self.network = network
         self.llm = llm
-        self.anti_example_store = anti_example_store
         self.d0_info = d0_info
         self.certainty = certainty
         self.tree_depth = tree_depth
@@ -61,7 +45,7 @@ class Replanner:
         处理一个失败任务的完整 S4 流程。
 
         对应原文档的三种情况：
-        1. 失效在执行层 → 用同样指令重走 S3（反例库会降权）
+        1. 失效在执行层 → 用同样指令重走 S3
         2. 失效在编排层 → 重新拆解（带失败上下文）
         3. 失效在更上层 → 从更上层重建子树
 
@@ -86,10 +70,7 @@ class Replanner:
             f"\n  偏差描述: {deviation.description}"
         )
 
-        # ---- 1. 记录失败案例到反例库 ----
-        self._record_failure(task, deviation)
-
-        # ---- 2. 判断处理方式 ----
+        # ---- 1. 判断处理方式 ----
         # 对应原文档：
         # "权限越界 → 回到上层重新拆解
         #  违反物理约束 → 回到编排层重规划
@@ -155,44 +136,14 @@ class Replanner:
             llm=self.llm,
             current_depth=1,
             max_depth=self.tree_depth,
-            prior_results=failure_context,  # 把失败信息作为上下文传入
-            anti_example_store=self.anti_example_store,
+            prior_results=failure_context,
             d0_info=self.d0_info,
             certainty=self.certainty,
-            is_replan=True,                 # 标记为重规划
-            failure_info=failure_context,   # 失败详情
+            is_replan=True,
+            failure_info=failure_context,
         )
 
         return orch_agent.execute()
-
-    def _record_failure(self, task: Task, deviation: Deviation):
-        """
-        将失败案例存入反例库。
-
-        
-        "每个失败案例记录包括：失败路径的任务描述、涉及设备的电气耦合强度 a、
-         BFS 距离 b、确定性指标 C、使用的工具调用序列、失败分类标签、
-         触发失败的上下文参数。"
-        """
-        case = FailureCase(
-            case_id=f"fail_{task.id}_{self.anti_example_store.size()}",
-            task_description=task.description,
-            coupling_strength=self.d0_info.get("coupling_strength_a", 0),
-            topology_depth=self.d0_info.get("topology_depth_b", 1),
-            certainty=self.certainty,
-            tool_sequence=[],  # 从 deviation context 中提取
-            failure_type=deviation.deviation_type.value,
-            context={
-                "deviation": deviation.description,
-                "expected": deviation.expected,
-                "actual": deviation.actual,
-            },
-        )
-        self.anti_example_store.add_case(case)
-        logger.info(
-            f"[反例库] 已记录失败案例 {case.case_id}，"
-            f"库中共 {self.anti_example_store.size()} 条"
-        )
 
     def _build_failure_context(
         self, task: Task, deviation: Deviation, prior_results: dict = None

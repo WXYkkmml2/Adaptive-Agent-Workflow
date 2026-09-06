@@ -1,4 +1,4 @@
-"""测试 S4 偏差检测、重规划、反例库填充。"""
+"""测试 S4 偏差检测与重规划流程。"""
 
 import pytest
 import logging
@@ -6,7 +6,6 @@ from grid.network import PowerNetwork
 from llm.client import MockLLMClient
 from agents.planner import Planner
 from agents.root_agent import RootAgent
-from agents.anti_example import AntiExampleStore, FailureCase
 from agents.deviation import (
     Deviation, DeviationType, detect_deviation,
 )
@@ -66,48 +65,6 @@ def test_detect_empty_results():
 
 
 # ============================================================
-# 反例库
-# ============================================================
-
-def test_anti_example_population():
-    """反例库填充后应可以匹配到。"""
-    store = AntiExampleStore()
-    store.add_case(FailureCase(
-        case_id="fail_001",
-        task_description="查询母线电压后调整发电机出力",
-        coupling_strength=0.5,
-        topology_depth=3,
-        certainty=0.6,
-        tool_sequence=["get_bus_voltage", "set_gen_output"],
-        failure_type="constraint_violation",
-    ))
-    assert store.size() == 1
-
-    matched = store.match("查询电压并调整发电机", 0.5, 3)
-    assert len(matched) >= 1
-
-
-def test_anti_example_downweight():
-    """匹配到反例应产生降权系数。"""
-    store = AntiExampleStore()
-    store.add_case(FailureCase(
-        case_id="fail_002",
-        task_description="调整发电机电压",
-        coupling_strength=0.5,
-        topology_depth=2,
-        certainty=0.7,
-        tool_sequence=["set_gen_voltage"],
-        failure_type="constraint_violation",
-    ))
-
-    matched = store.match("调整发电机电压设定值", 0.5, 2)
-    if matched:
-        dw = store.get_downweight_tools(matched)
-        assert "set_gen_voltage" in dw
-        assert dw["set_gen_voltage"] < 1.0
-
-
-# ============================================================
 # 重规划器
 # ============================================================
 
@@ -115,12 +72,11 @@ def test_replanner_basic():
     """重规划器应能成功重规划一个失败任务。"""
     network = PowerNetwork()
     llm = MockLLMClient(failure_mode=False)  # 不注入失败，直接成功
-    store = AntiExampleStore()
     d0_info = {"coupling_strength_a": 0.5, "topology_depth_b": 2,
                "topology_depth_b_norm": 0.4}
 
     replanner = Replanner(
-        network=network, llm=llm, anti_example_store=store,
+        network=network, llm=llm,
         d0_info=d0_info, certainty=0.7, tree_depth=3,
     )
 
@@ -138,8 +94,6 @@ def test_replanner_basic():
         task, deviation, Permission.root_permission()
     )
     assert result["success"] is True
-    # 失败案例应被记录
-    assert store.size() >= 1
 
 
 def test_replanner_respects_max_attempts():
@@ -150,10 +104,9 @@ def test_replanner_respects_max_attempts():
     # 直接测试 attempt > MAX
     from config.settings import MAX_REPLAN_ATTEMPTS
     llm = MockLLMClient(failure_mode=False)
-    store = AntiExampleStore()
 
     replanner = Replanner(
-        network=network, llm=llm, anti_example_store=store,
+        network=network, llm=llm,
         d0_info={}, certainty=0.7, tree_depth=3,
     )
 
@@ -208,7 +161,6 @@ def test_e2e_failure_and_replan():
     1. 降低发电机出力使 Bus 13 电压偏低
     2. MockLLM 首次返回不足的调整 → 约束违规 → 触发 S4
     3. 重规划返回更强的调整 → 成功
-    4. 反例库应被填充
     """
     network = PowerNetwork()
 
@@ -222,7 +174,6 @@ def test_e2e_failure_and_replan():
     assert bus13_v < 1.0, f"Bus 13 电压应偏低，实际 {bus13_v}"
 
     llm = MockLLMClient(failure_mode=True)  # 注入失败
-    store = AntiExampleStore()
     planner = Planner(network, llm)
 
     plan = planner.plan("Bus 14 电压过低，请恢复")
@@ -233,16 +184,9 @@ def test_e2e_failure_and_replan():
         tree_depth=plan["tree_depth"],
         d0_info=plan["d0_info"],
         certainty=plan["certainty"],
-        anti_example_store=store,
     )
 
     result = root.execute()
 
-    # 最终应该成功（重规划后用更强调整修复了）
     assert result["success"] is True
-
-    # 反例库应被填充
-    assert store.size() > 0
-
-    # 应该有重规划记录
     assert len(root.replan_log) > 0

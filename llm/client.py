@@ -217,16 +217,35 @@ class RealLLMClient(LLMClient):
     """真实 LLM 客户端（可选，需要 API Key）。"""
 
     def __init__(self):
-        self.api_key = os.environ.get("LLM_API_KEY", "")
+        # 从环境读取 API Key 并进行容错清洗：去除左右花引号、直引号和首尾空白。
+        
+        raw_key = os.environ.get("LLM_API_KEY", "")
+        if isinstance(raw_key, str):
+            cleaned = raw_key.strip()
+            # 常见的“花引号”清理（U+201C, U+201D）以及普通引号
+            cleaned = cleaned.replace('\u201c', '').replace('\u201d', '')
+            if (cleaned.startswith('"') and cleaned.endswith('"')) or (
+                    cleaned.startswith("'") and cleaned.endswith("'")):
+                cleaned = cleaned[1:-1]
+            cleaned = cleaned.strip()
+        else:
+            cleaned = ""
+
+        self.api_key = cleaned
         self.base_url = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
         self.model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
         if not self.api_key:
             raise ValueError("未设置 LLM_API_KEY")
+        if raw_key and raw_key != self.api_key:
+            logger.info("检测到并清洗了环境中的 LLM_API_KEY（可能包含不合法引号或空白）")
         logger.info(f"使用 RealLLMClient: model={self.model}")
 
     def complete(self, system_prompt: str, user_prompt: str, temperature: float = 0.7) -> str:
         import urllib.request
         import urllib.error
+        from llm.ssl_utils import get_ssl_context
+        import time
+        import socket
 
         payload = json.dumps({
             "model": self.model,
@@ -246,13 +265,39 @@ class RealLLMClient(LLMClient):
             },
         )
 
+        # 可通过环境变量在开发/CI 环境下控制超时与重试次数，避免长时间阻塞
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            max_retries = int(os.environ.get("LLM_MAX_RETRIES", "3"))
+        except Exception:
+            max_retries = 3
+        try:
+            base_timeout = int(os.environ.get("LLM_TIMEOUT", "120"))
+        except Exception:
+            base_timeout = 120
+        for attempt in range(1, max_retries + 1):
+            try:
+                context = get_ssl_context()
+                if context is not None:
+                    with urllib.request.urlopen(req, timeout=base_timeout, context=context) as resp:
+                        raw = resp.read().decode("utf-8")
+                else:
+                    with urllib.request.urlopen(req, timeout=base_timeout) as resp:
+                        raw = resp.read().decode("utf-8")
+
+                data = json.loads(raw)
                 return data["choices"][0]["message"]["content"]
-        except (urllib.error.URLError, KeyError) as e:
-            logger.error(f"LLM API 调用失败: {e}")
-            return "{}"
+
+            except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+                logger.warning(f"LLM API 调用（尝试 {attempt}/{max_retries}）失败: {e}")
+                if attempt < max_retries:
+                    time.sleep(2 ** (attempt - 1))
+                    continue
+                else:
+                    logger.error(f"LLM API 调用最终失败: {e}")
+                    return "{}"
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.error(f"LLM 响应解析失败: {e}\n原始响应（截断）: {raw[:1000]}")
+                return "{}"
 
 
 def create_llm_client(failure_mode: bool = False) -> LLMClient:

@@ -1,10 +1,7 @@
 """
-S2 根智能体。（Step 3 更新：集成 S4 重规划循环）
+S2 根智能体。
 
-新增逻辑：
-  任务失败 → 检查是否有偏差信息 → 调用 Replanner → 重试
-  重试成功 → 正常继续后续任务
-  重试也失败 → 标记需要人工介入
+负责任务 DAG 调度和 S4 重规划循环。
 """
 
 import logging
@@ -13,20 +10,13 @@ from agents.permission import Permission
 from agents.orchestration_agent import OrchestrationAgent
 from agents.replanner import Replanner
 from agents.deviation import Deviation, DeviationType
-from agents.anti_example import AntiExampleStore
 from llm.client import LLMClient
 
 logger = logging.getLogger(__name__)
 
 
 class RootAgent:
-    """
-    根智能体：任务 DAG 调度器 + S4 重规划入口。
-
-    对应原文档：
-    "根智能体只管任务级别的状态（t1 完成了没有），
-     不管具体设备级别的比对。"
-    """
+    """根智能体：任务 DAG 调度器 + S4 重规划入口。"""
 
     def __init__(
         self,
@@ -36,7 +26,6 @@ class RootAgent:
         tree_depth: int,
         d0_info: dict,
         certainty: float,
-        anti_example_store: AntiExampleStore = None,
     ):
         self.network = network
         self.dag = dag
@@ -45,16 +34,13 @@ class RootAgent:
         self.d0_info = d0_info
         self.certainty = certainty
         self.permission = Permission.root_permission()
-        self.anti_example_store = anti_example_store or AntiExampleStore()
 
         self.execution_log = []
-        self.replan_log = []   # ← Step 3 新增
+        self.replan_log = []
 
-        # 创建重规划器
         self.replanner = Replanner(
             network=self.network,
             llm=self.llm,
-            anti_example_store=self.anti_example_store,
             d0_info=self.d0_info,
             certainty=self.certainty,
             tree_depth=self.tree_depth,
@@ -137,7 +123,6 @@ class RootAgent:
             logger.info(f"  {marker} {tid}: {status}")
         if self.replan_log:
             logger.info(f"  重规划次数: {len(self.replan_log)}")
-            logger.info(f"  反例库大小: {self.anti_example_store.size()}")
         logger.info("=" * 50)
 
         return {
@@ -146,7 +131,6 @@ class RootAgent:
             "execution_log": self.execution_log,
             "replan_log": self.replan_log,
             "task_results": self.dag.get_task_results(),
-            "anti_example_count": self.anti_example_store.size(),
         }
 
     def _dispatch_task(self, task) -> dict:
@@ -169,7 +153,6 @@ class RootAgent:
             current_depth=1,
             max_depth=self.tree_depth,
             prior_results=prior_results,
-            anti_example_store=self.anti_example_store,
             d0_info=self.d0_info,
             certainty=self.certainty,
         )

@@ -194,8 +194,9 @@ TOOL_REGISTRY = {
         "description": "查询母线电压幅值和相角",
         "device_types": {"bus"},
         "risk_level": "low",
-        "requires_net_arg": True,  # 需要传入 net 参数
+        "requires_net_arg": True,
         "allowed_params": {"bus_id"},
+        "required_params": {"bus_id"},
     },
     "get_neighbor_buses": {
         "func": get_neighbor_buses,
@@ -204,6 +205,7 @@ TOOL_REGISTRY = {
         "risk_level": "low",
         "requires_net_arg": True,
         "allowed_params": {"bus_id"},
+        "required_params": {"bus_id"},
     },
     "get_line_loading": {
         "func": get_line_loading,
@@ -212,6 +214,7 @@ TOOL_REGISTRY = {
         "risk_level": "low",
         "requires_net_arg": True,
         "allowed_params": {"line_id"},
+        "required_params": {"line_id"},
     },
     "get_generator_state": {
         "func": get_generator_state,
@@ -220,6 +223,7 @@ TOOL_REGISTRY = {
         "risk_level": "low",
         "requires_net_arg": True,
         "allowed_params": {"gen_id"},
+        "required_params": {"gen_id"},
     },
     "simulate_action": {
         "func": simulate_action,
@@ -228,6 +232,7 @@ TOOL_REGISTRY = {
         "risk_level": "medium",
         "requires_net_arg": True,
         "allowed_params": {"action"},
+        "required_params": {"action"},
     },
     "check_constraints": {
         "func": check_constraints,
@@ -236,9 +241,8 @@ TOOL_REGISTRY = {
         "risk_level": "low",
         "requires_net_arg": True,
         "allowed_params": set(),
+        "required_params": set(),
     },
-
-    # 写入修改类操作以便统一做参数名校验（实际执行可能在 ExecutionAgent 中直接调用 network 方法）
     "set_gen_voltage": {
         "func": None,
         "description": "设置发电机电压设定值",
@@ -246,6 +250,7 @@ TOOL_REGISTRY = {
         "risk_level": "medium",
         "requires_net_arg": False,
         "allowed_params": {"gen_id", "vm_pu"},
+        "required_params": {"gen_id", "vm_pu"},
     },
     "set_gen_output": {
         "func": None,
@@ -254,6 +259,7 @@ TOOL_REGISTRY = {
         "risk_level": "medium",
         "requires_net_arg": False,
         "allowed_params": {"gen_id", "p_mw"},
+        "required_params": {"gen_id", "p_mw"},
     },
     "set_line_status": {
         "func": None,
@@ -262,6 +268,7 @@ TOOL_REGISTRY = {
         "risk_level": "high",
         "requires_net_arg": False,
         "allowed_params": {"line_id", "in_service"},
+        "required_params": {"line_id", "in_service"},
     },
 }
 
@@ -294,73 +301,126 @@ def get_available_tools(permission: dict = None) -> list:
     return available
 
 
-def validate_tool_params(tool_name: str, params: dict) -> tuple:
+def _infer_missing_param(tool_name: str, key: str, context: str = ""):
+    """从上下文中尝试补全丢失的必需参数。"""
+    if not context:
+        return None
+
+    context_l = context.lower()
+    patterns = {
+        "bus_id": [r"bus\s*(?:[:：])?\s*(\d+)", r"母线\s*(?:[:：])?\s*(\d+)", r"bus\s+(\d+)", r"母线\s+(\d+)"] ,
+        "gen_id": [r"gen\s*(?:[:：])?\s*(\d+)", r"发电机\s*(?:[:：])?\s*(\d+)", r"gen\s+(\d+)", r"发电机\s+(\d+)"] ,
+        "line_id": [r"line\s*(?:[:：])?\s*(\d+)", r"线路\s*(?:[:：])?\s*(\d+)", r"line\s+(\d+)", r"线路\s+(\d+)"] ,
+    }
+
+    for pattern in patterns.get(key, []):
+        match = __import__("re").search(pattern, context_l)
+        if match:
+            try:
+                return int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+
+    return None
+
+
+def clean_tool_params(tool_name: str, params: dict, context: str = "") -> dict:
+    """清洗工具参数：删除非法 key，补全缺失的必需参数。"""
+    if tool_name not in TOOL_REGISTRY:
+        return {}
+
+    meta = TOOL_REGISTRY[tool_name]
+    allowed = meta.get("allowed_params")
+    required = meta.get("required_params", set())
+
+    cleaned = dict(params or {}) if isinstance(params, dict) else {}
+
+    if allowed is not None:
+        cleaned = {k: v for k, v in cleaned.items() if k in allowed}
+
+    if tool_name == "check_constraints":
+        return {}
+
+    for key in list(required):
+        if key not in cleaned or cleaned[key] in (None, ""):
+            inferred = _infer_missing_param(tool_name, key, context)
+            if inferred is not None:
+                cleaned[key] = inferred
+
+    return cleaned
+
+
+def validate_tool_params(tool_name: str, params: dict, context: str = "") -> tuple:
     """
-    校验给定工具的参数名是否合法。
+    校验给定工具的参数名是否合法，并检查必需参数是否缺失。
 
     返回 (True, None) 或 (False, error_message)。
     """
     if tool_name not in TOOL_REGISTRY:
         return False, f"工具 '{tool_name}' 不存在"
 
-    allowed = TOOL_REGISTRY[tool_name].get("allowed_params")
-    # 如果 allowed_params 是 None，视为不做校验（向后兼容）
-    if allowed is None:
+    meta = TOOL_REGISTRY[tool_name]
+    allowed = meta.get("allowed_params")
+    required = meta.get("required_params", set())
+    cleaned = clean_tool_params(tool_name, params, context)
+
+    if allowed is not None:
+        bad = [k for k in (params or {}).keys() if k not in allowed]
+        if bad:
+            return False, f"参数 {bad} 不存在，合法参数为 {sorted(list(allowed))}"
+
+    if tool_name == "check_constraints":
         return True, None
 
-    # 检查传入的参数名是否在白名单里
-    bad = [k for k in params.keys() if k not in allowed]
-    if bad:
-        return False, f"参数 {bad} 不存在，合法参数为 {sorted(list(allowed))}"
+    missing = [k for k in sorted(required) if k not in cleaned or cleaned[k] in (None, "")]
+    if missing:
+        return False, f"工具 '{tool_name}' 缺少必需参数: {missing}"
+
     return True, None
 
 
 def call_tool(tool_name: str, net, **kwargs) -> dict:
     """
     统一的工具调用入口。
-    
-    后续执行智能体通过这个入口调用工具，
+
+    在真正调用前先做参数清洗：
+    - 删除非法参数
+    - 补全缺失的必需参数
+    - 对无参数工具直接清空参数
     """
     if tool_name not in TOOL_REGISTRY:
         return {"success": False, "error": f"工具 '{tool_name}' 不存在"}
 
+    context = kwargs.pop("context", "")
+    cleaned = clean_tool_params(tool_name, kwargs, context)
+
+    if tool_name == "check_constraints":
+        cleaned = {}
+
+    ok, err = validate_tool_params(tool_name, cleaned, context)
+    if not ok:
+        return {"success": False, "tool": tool_name, "error": err}
+
     func = TOOL_REGISTRY[tool_name]["func"]
-    # 参数名校验网关
-    allowed = TOOL_REGISTRY[tool_name].get("allowed_params")
-    if allowed is not None:
-        # kwargs 里除去 None 值外的参数名
-        bad = [k for k in kwargs.keys() if k not in allowed]
-        if bad:
-            return {
-                "success": False,
-                "tool": tool_name,
-                "error": f"参数 {bad} 不存在，合法参数为 {sorted(list(allowed))}",
-            }
     try:
-        # 容错：如果传入的是 1-based 编号（例如用户/LLM 使用人类编号），
-        # 自动尝试转换为 0-based 索引以匹配 pandapower 的表索引。
-        # 常见的参数包括 bus_id, line_id, gen_id。
         for key in ("bus_id", "line_id", "gen_id"):
-            if key in kwargs:
+            if key in cleaned:
                 try:
-                    val = int(kwargs[key])
+                    val = int(cleaned[key])
                 except Exception:
                     continue
-                # 检查在 net 表中是否存在该索引，否则尝试减 1
                 table = None
                 if key == "bus_id":
                     table = getattr(net, "bus", None)
                 elif key == "line_id":
                     table = getattr(net, "line", None)
                 elif key == "gen_id":
-                    # gen table is named 'gen'
                     table = getattr(net, "gen", None)
 
-                if table is not None and val not in table.index:
-                    if (val - 1) in table.index:
-                        kwargs[key] = val - 1
-        
-        result = func(net, **kwargs)
+                if table is not None and val not in table.index and (val - 1) in table.index:
+                    cleaned[key] = val - 1
+
+        result = func(net, **cleaned)
         return {"success": True, "tool": tool_name, "result": result}
     except Exception as e:
         return {"success": False, "tool": tool_name, "error": str(e)}

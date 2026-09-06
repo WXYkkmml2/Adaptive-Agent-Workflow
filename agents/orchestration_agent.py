@@ -34,11 +34,10 @@ class OrchestrationAgent:
         current_depth: int,
         max_depth: int,
         prior_results: dict = None,
-        anti_example_store=None,
         d0_info: dict = None,
         certainty: float = 0.7,
-        is_replan: bool = False,       # ← Step 3 新增
-        failure_info: dict = None,     # ← Step 3 新增
+        is_replan: bool = False,
+        failure_info: dict = None,
     ):
         self.agent_id = agent_id
         self.task = task
@@ -48,7 +47,6 @@ class OrchestrationAgent:
         self.current_depth = current_depth
         self.max_depth = max_depth
         self.prior_results = prior_results or {}
-        self.anti_example_store = anti_example_store
         self.d0_info = d0_info or {}
         self.certainty = certainty
         self.is_replan = is_replan
@@ -144,7 +142,6 @@ class OrchestrationAgent:
                 permission=self.permission,
                 network=self.network,
                 llm=self.llm,
-                anti_example_store=self.anti_example_store,
                 d0_info=self.d0_info,
                 certainty=self.certainty,
                 depth=self.current_depth + 1,
@@ -186,7 +183,6 @@ class OrchestrationAgent:
                 current_depth=self.current_depth + 1,
                 max_depth=self.max_depth,
                 prior_results=self.prior_results,
-                anti_example_store=self.anti_example_store,
                 d0_info=self.d0_info,
                 certainty=self.certainty,
                 is_replan=self.is_replan,

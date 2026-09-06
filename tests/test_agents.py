@@ -8,7 +8,6 @@ from agents.planner import Planner
 from agents.root_agent import RootAgent
 from agents.task import TaskDAG, Task, TaskStatus
 from agents.permission import Permission
-from agents.anti_example import AntiExampleStore
 
 # 让测试输出智能体日志
 logging.basicConfig(level=logging.WARNING)
@@ -104,13 +103,6 @@ def test_permission_narrowing():
     result = parent.intersect(child_required)
     assert result.voltage_levels == set()   # 交集为空
     assert result.device_types == {"bus"}   # 只保留 bus
-
-
-def test_anti_example_empty_store():
-    """空反例库匹配应返回空列表，不影响正常流程。"""
-    store = AntiExampleStore()
-    matched = store.match("查询电压", 0.5, 3)
-    assert matched == []
 
 
 def test_execution_log(setup):

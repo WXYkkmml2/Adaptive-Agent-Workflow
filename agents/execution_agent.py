@@ -1,18 +1,15 @@
 """
 S3 执行智能体。
 
-对应原文档 S3 的完整流程：
-  00 反例库匹配（不调用大模型）
+执行流程：
   01 调用大模型（输出候选工具调用序列 + 执行策略）
-  02 反例降权（对候选方案概率做降权和重新归一化）
-  03 确定采样温度（用 a、b、C 计算）
-  04 执行策略分支（直接/仿真/人工）
-  05 最终采样（在收缩后的概率空间中采样工具调用序列）
+  02 确定采样温度（用 a、b、C 计算）
+  03 执行策略分支（直接/仿真/人工）
+  04 最终执行工具调用序列
 """
 
 import logging
 import json
-import numpy as np
 from agents.permission import Permission
 from grid.tools import get_available_tools, call_tool, TOOL_REGISTRY, validate_tool_params
 from llm.client import LLMClient
@@ -36,7 +33,6 @@ class ExecutionAgent:
         permission: Permission,
         network,
         llm: LLMClient,
-        anti_example_store=None,
         d0_info: dict = None,
         certainty: float = 0.7,
         depth: int = 2,
@@ -46,7 +42,6 @@ class ExecutionAgent:
         self.permission = permission
         self.network = network
         self.llm = llm
-        self.anti_example_store = anti_example_store
         self.d0_info = d0_info or {}
         self.certainty = certainty
         self.depth = depth
@@ -58,58 +53,25 @@ class ExecutionAgent:
         indent = "  " * self.depth
         logger.info(f"{indent}[{self.agent_id}] 执行: {self.instruction.get('description', '')}")
 
-        # ---- 00. 反例库匹配 ----
-        downweight = self._match_anti_examples()
-
-        # ---- 01. 确定工具调用序列 ----
         tool_plan = self._plan_tool_calls()
         if not tool_plan:
             return self._fail("无法生成工具调用计划")
 
-        # ---- 02. 反例降权 ----
         tool_sequence = tool_plan.get("tool_sequence", [])
         strategy = tool_plan.get("strategy", "direct")
 
-        # ---- 03. 确定采样温度 ----
         temperature = self._compute_temperature()
         logger.info(f"{indent}  采样温度: {temperature:.2f}, 执行策略: {strategy}")
 
-        # ---- 04. 执行策略分支 ----
         if strategy == "human":
             logger.info(f"{indent}  ⚠ 高风险操作，需要人工确认（MVP 中自动通过）")
 
         if strategy == "simulate":
-            # 先仿真验证
             sim_ok = self._simulate_first(tool_sequence)
             if not sim_ok:
                 return self._fail("仿真验证未通过")
 
-        # ---- 05. 执行工具调用序列 ----
         return self._execute_tools(tool_sequence)
-
-    def _match_anti_examples(self) -> dict:
-        """
-        00 反例库匹配。
-        
-        对应原文档：
-        "不调用大模型，就是用传统向量检索，
-         输出的是哪些候选方案需要降权的约束信息"
-        """
-        if self.anti_example_store is None or self.anti_example_store.size() == 0:
-            return {}
-
-        matched = self.anti_example_store.match(
-            task_description=self.instruction.get("description", ""),
-            coupling_strength=self.d0_info.get("coupling_strength_a", 0),
-            topology_depth=self.d0_info.get("topology_depth_b", 1),
-        )
-
-        if matched:
-            downweight = self.anti_example_store.get_downweight_tools(matched)
-            logger.info(f"  反例匹配命中 {len(matched)} 条，降权工具: {downweight}")
-            return downweight
-
-        return {}
 
     def _plan_tool_calls(self) -> dict:
         """
@@ -237,25 +199,32 @@ class ExecutionAgent:
 
             # 对于修改类工具，直接在真实网络上操作
             # （在 MVP 中"真实网络"就是 pandapower 的 net 对象）
+            context = self.instruction.get("description", "")
             if tool_name in ("set_gen_voltage", "set_gen_output", "set_line_status"):
                 # 修改类操作：先校验参数名，再调用 network 方法修改真实网络
-                ok, err = validate_tool_params(tool_name, params)
+                ok, err = validate_tool_params(tool_name, params, context=context)
                 if not ok:
                     result = {"success": False, "tool": tool_name, "error": err}
                 else:
                     try:
+                        cleaned = params.copy()
                         if tool_name == "set_gen_voltage":
-                            self.network.set_gen_voltage(**params)
+                            self.network.set_gen_voltage(**cleaned)
                         elif tool_name == "set_gen_output":
-                            self.network.set_gen_output(**params)
+                            self.network.set_gen_output(**cleaned)
                         elif tool_name == "set_line_status":
-                            self.network.set_line_status(**params)
+                            self.network.set_line_status(**cleaned)
                         result = {"success": True, "tool": tool_name, "result": "操作已执行"}
                     except Exception as e:
                         result = {"success": False, "tool": tool_name, "error": str(e)}
             else:
                 # 查询类工具通过统一入口调用
-                result = call_tool(tool_name, self.network.net, **params)
+                result = call_tool(
+                    tool_name,
+                    self.network.net,
+                    context=context,
+                    **params,
+                )
 
             logger.info(
                 f"{indent}  工具 {tool_name}: "
