@@ -150,9 +150,27 @@ class Planner:
 
         # 解析为 TaskDAG
         dag = TaskDAG()
-        for t_data in response.get("tasks", []):
+        tasks_list = response.get("tasks", []) if isinstance(response, dict) else []
+        for idx, t_data in enumerate(tasks_list):
+            if not isinstance(t_data, dict):
+                logger.warning(f"LLM 返回的任务项不是字典，跳过：{str(t_data)[:200]}")
+                continue
+
+            task_id = t_data.get("id")
+            if not task_id:
+                # 自动生成一个任务 id，避免 KeyError；同时记录警告和原始条目
+                task_id = f"t{idx+1}"
+                logger.warning(f"LLM 返回的任务缺少 'id' 字段，使用自动 id={task_id}，原始条目预览: {str(t_data)[:200]}")
+
+            # 若生成的 id 与已存在冲突，则调整序号以保证唯一性
+            base_id = task_id
+            counter = 1
+            while task_id in dag.tasks:
+                task_id = f"{base_id}_{counter}"
+                counter += 1
+
             task = Task(
-                id=t_data["id"],
+                id=task_id,
                 description=t_data.get("description", ""),
                 dependencies=t_data.get("dependencies", []),
                 devices=t_data.get("devices", [target_bus]),

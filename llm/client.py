@@ -34,10 +34,18 @@ class LLMClient:
 
         cleaned = re.sub(r"^```(?:json)?\s*", "", str(raw).strip())
         cleaned = re.sub(r"\s*```$", "", cleaned)
+        # 如果清理后内容为空（例如 LLM 返回空字符串或仅包含代码块标记），视为解析失败
+        if not cleaned or cleaned.strip() == "":
+            logger.error(f"[LLM] JSON 解析失败: 清理后响应为空\n原始响应: {raw}")
+            msg = "LLM 返回空响应或仅包含代码块标记，无法解析为 JSON"
+            return {"error": "LLM_ERROR", "message": msg, "raw": str(raw)}
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError as e:
             logger.error(f"[LLM] JSON 解析失败: {e}\n原始响应: {raw}")
+            msg = f"LLM JSON 解析失败: {e}"
+            # 返回结构化错误以便上层代码和测试能够检测到解析失败
+            return {"error": "LLM_ERROR", "message": msg, "raw": str(raw)}
             return {
                 "error": "LLM_ERROR",
                 "message": f"LLM JSON 解析失败: {e}",
@@ -263,10 +271,17 @@ class RealLLMClient(LLMClient):
         import time
         import socket
 
+        # 强制模型只输出有效 JSON 的系统指令，放在用户提供的 system_prompt 之前
+        json_enforcer = (
+            "你是一个格式化助手：严格只输出有效的 JSON，不要任何解释或多余文本。"
+            " 如果无法生成有效 JSON，请返回 {\"error\": \"...\"} 形式的 JSON。"
+        )
+        enforced_system = json_enforcer + "\n" + (system_prompt or "")
+
         payload_obj = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": enforced_system},
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": min(max(float(temperature), 0.1), 0.2),
@@ -285,13 +300,19 @@ class RealLLMClient(LLMClient):
         )
 
         try:
-            max_retries = int(os.environ.get("LLM_MAX_RETRIES", "1"))
+            max_retries = int(os.environ.get("LLM_MAX_RETRIES", "2"))
         except Exception:
-            max_retries = 1
+            max_retries = 2
         try:
             base_timeout = int(os.environ.get("LLM_TIMEOUT", "20"))
         except Exception:
             base_timeout = 20
+
+        # 可配置的重写（reformat）请求超时，避免在短超时下直接失败
+        try:
+            reformat_timeout = int(os.environ.get("LLM_REFORMAT_TIMEOUT", str(min(base_timeout, 10))))
+        except Exception:
+            reformat_timeout = min(base_timeout, 10)
 
         logger.info(f"[LLM] start: source={source}, model={self.model}, timeout={base_timeout}s, retries={max_retries}")
         start_time = time.perf_counter()
@@ -302,16 +323,165 @@ class RealLLMClient(LLMClient):
                 context = get_ssl_context()
                 if context is not None:
                     with urllib.request.urlopen(req, timeout=base_timeout, context=context) as resp:
+                        status = resp.getcode()
+                        headers = dict(resp.getheaders())
                         raw = resp.read().decode("utf-8")
                 else:
                     with urllib.request.urlopen(req, timeout=base_timeout) as resp:
+                        status = resp.getcode()
+                        headers = dict(resp.getheaders())
                         raw = resp.read().decode("utf-8")
 
-                data = json.loads(raw)
-                content = data["choices"][0]["message"]["content"]
-                elapsed = time.perf_counter() - start_time
-                logger.info(f"[LLM] success: source={source}, attempt={attempt}/{max_retries}, elapsed={elapsed:.2f}s")
-                return content
+                # 解析响应并取出消息文本
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError as e:
+                    raw_excerpt = raw[:2000]
+                    logger.error(f"[LLM] 非 JSON 响应或空响应: {e}; status={status}; headers={headers}; raw_excerpt={raw_excerpt}")
+                    return json.dumps({
+                        "error": "LLM_ERROR",
+                        "message": f"LLM 返回非 JSON 响应或空响应: {e}",
+                        "status": status,
+                        "headers": headers,
+                        "raw": raw_excerpt,
+                    }, ensure_ascii=False)
+                # 更稳健地提取 message 内容：优先取 content，其次尝试 reasoning_content、text、delta.content 等备用字段
+                choice = data.get("choices", [])[0] if data.get("choices") else {}
+                message = choice.get("message", {}) if isinstance(choice, dict) else {}
+                content = message.get("content") if isinstance(message, dict) else None
+                if not content:
+                    # 尝试备用字段
+                    content = message.get("reasoning_content") or choice.get("text") or (message.get("delta") or {}).get("content") or ""
+                    if content:
+                        logger.info(f"[LLM] using alternate message field for content: source={source}")
+
+                # 尝试从 content 中提取代码块内的 JSON 并验证
+                extracted = re.sub(r"^```(?:json)?\s*", "", str(content).strip())
+                extracted = re.sub(r"\s*```$", "", extracted)
+                try:
+                    json.loads(extracted)
+                    # 如果提取出的内容是合法 JSON，直接返回提取后的文本
+                    elapsed = time.perf_counter() - start_time
+                    logger.info(f"[LLM] success(json-extract): source={source}, attempt={attempt}/{max_retries}, elapsed={elapsed:.2f}s")
+                    return extracted
+                except Exception:
+                    # 继续后续处理
+                    pass
+
+                # 如果 content 为空或仅包含空白，记录更多 HTTP 上下文
+                if not content or str(content).strip() == "":
+                    raw_excerpt = raw[:2000]
+                    logger.error(f"[LLM] empty_content: source={source}, status={status}, headers={headers}, raw_excerpt={raw_excerpt}")
+                    err_msg = "LLM 返回空的 content 字段"
+                    return json.dumps({
+                        "error": "LLM_ERROR",
+                        "message": err_msg,
+                        "raw": raw,
+                        "status": status,
+                        "headers": headers,
+                        "source": source,
+                    }, ensure_ascii=False)
+
+                # 若 content 不是合法 JSON，尝试自动向模型发起一次“仅输出 JSON”的重写请求
+                try:
+                    reformat_payload = {
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": "你是一个格式化助手：严格只输出有效的 JSON，不要任何解释或多余文本。"},
+                            {"role": "user", "content": f"请将下面的文本仅转换为有效的 JSON（不要解释）：\n\n{content}"},
+                        ],
+                        "temperature": 0.0,
+                    }
+                    req2 = urllib.request.Request(
+                        f"{self.base_url}/chat/completions",
+                        data=json.dumps(reformat_payload).encode("utf-8"),
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {self.api_key}",
+                        },
+                    )
+                    # 只做一次短重试（同步调用），超时可通过 LLM_REFORMAT_TIMEOUT 配置
+                    if context is not None:
+                        with urllib.request.urlopen(req2, timeout=reformat_timeout, context=context) as resp2:
+                            raw2 = resp2.read().decode("utf-8")
+                    else:
+                        with urllib.request.urlopen(req2, timeout=reformat_timeout) as resp2:
+                            raw2 = resp2.read().decode("utf-8")
+
+                    # 尝试从重写结果中提取 JSON
+                    try:
+                        data2 = json.loads(raw2)
+                        formatted = data2["choices"][0]["message"]["content"]
+                    except Exception:
+                        formatted = raw2
+
+                    formatted_extracted = re.sub(r"^```(?:json)?\s*", "", str(formatted).strip())
+                    formatted_extracted = re.sub(r"\s*```$", "", formatted_extracted)
+                    def _try_extract_json_fragment(text: str):
+                        if not text or not isinstance(text, str):
+                            return None
+                        # 找到第一个 '{' 与最后一个 '}' 的子串，尝试解析
+                        start = text.find("{")
+                        end = text.rfind("}")
+                        if start != -1 and end != -1 and end > start:
+                            candidate = text[start:end+1]
+                            try:
+                                json.loads(candidate)
+                                return candidate
+                            except Exception:
+                                return None
+                        return None
+
+                    try:
+                        json.loads(formatted_extracted)
+                        logger.info(f"[LLM] reformat success: source={source}")
+                        return formatted_extracted
+                    except Exception:
+                        logger.error(f"[LLM] reformat failed: source={source}, formatted_preview={formatted_extracted[:1000]}")
+                        # 在放弃之前尝试从原始 content 中提取 JSON 片段
+                        fragment = _try_extract_json_fragment(content) or _try_extract_json_fragment(formatted_extracted)
+                        if fragment:
+                            logger.info(f"[LLM] extracted JSON fragment from non-JSON content: source={source}")
+                            return fragment
+                        # 返回结构化错误，包含原始 content 以便上层能统一处理
+                        elapsed = time.perf_counter() - start_time
+                        logger.info(f"[LLM] success (non-json): source={source}, attempt={attempt}/{max_retries}, elapsed={elapsed:.2f}s")
+                        return json.dumps({
+                            "error": "LLM_ERROR",
+                            "message": "LLM 返回非 JSON 内容且重写后仍非 JSON",
+                            "raw": content,
+                            "source": source,
+                        }, ensure_ascii=False)
+                except Exception as e:
+                    logger.warning(f"[LLM] reformat request failed: {e}")
+                    # 在放弃之前尝试从 content 中提取 JSON 片段
+                    def _try_extract_json_fragment(text: str):
+                        if not text or not isinstance(text, str):
+                            return None
+                        start = text.find("{")
+                        end = text.rfind("}")
+                        if start != -1 and end != -1 and end > start:
+                            candidate = text[start:end+1]
+                            try:
+                                json.loads(candidate)
+                                return candidate
+                            except Exception:
+                                return None
+                        return None
+
+                    fragment = _try_extract_json_fragment(content)
+                    if fragment:
+                        logger.info(f"[LLM] extracted JSON fragment after reformat failure: source={source}")
+                        return fragment
+
+                    elapsed = time.perf_counter() - start_time
+                    logger.info(f"[LLM] success (non-json, no-reformat): source={source}, attempt={attempt}/{max_retries}, elapsed={elapsed:.2f}s")
+                    return json.dumps({
+                        "error": "LLM_ERROR",
+                        "message": f"LLM 返回非 JSON 内容，重写请求失败: {e}",
+                        "raw": content,
+                        "source": source,
+                    }, ensure_ascii=False)
 
             except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
                 elapsed = time.perf_counter() - attempt_start
