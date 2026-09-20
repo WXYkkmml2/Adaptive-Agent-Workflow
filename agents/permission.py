@@ -72,12 +72,12 @@ class Permission:
         根据任务涉及的设备，推导出该任务所需的最小权限。
         在 IEEE 14-bus 中简化处理：所有设备都在同一区域。
         """
-        device_types = set()
+        device_types = {"bus", "line", "trafo"}
         if task.device_type:
             device_types.add(task.device_type)
-        # 允许任务所需的常见分析/执行工具在同一权限范围内可用。
-        # 这包括 bus/line/gen/trafo 的查询与仿真工具，避免在 S3 中被误判为“工具不在权限中”。
-        device_types.update({"bus", "line", "gen", "trafo"})
+        description = (task.description or "").strip()
+        if description.startswith(("仿真", "执行", "调整", "调节", "恢复")) or "发电机" in description:
+            device_types.add("gen")
 
         return Permission(
             regions={"ieee14"},

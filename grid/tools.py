@@ -16,6 +16,17 @@ import copy
 import pandapower as pp
 from config.settings import BUS_VOLTAGE_MIN, BUS_VOLTAGE_MAX, LINE_LOADING_MAX
 
+_illegal_tool_calls = 0
+
+
+def reset_tool_counters() -> None:
+    global _illegal_tool_calls
+    _illegal_tool_calls = 0
+
+
+def get_tool_counters() -> dict:
+    return {"illegal_tool_calls": _illegal_tool_calls}
+
 
 # ============================================================
 # 工具函数定义
@@ -136,8 +147,7 @@ def check_constraints(net) -> dict:
     """
     校验当前网络是否满足运行约束。
     
-    检查所有母线电压是否在 [0.95, 1.05] p.u.，
-    所有线路负载率是否 < 100%。
+    使用 settings.py 中的母线电压和线路负载率上下限。
     
     返回:
         violations: 违规项列表（空列表 = 全部满足）
@@ -179,6 +189,24 @@ def check_constraints(net) -> dict:
         "violation_count": len(violations),
         "violations": violations,
     }
+
+
+def constraints_not_worse(before: dict, after: dict, tolerance: float = 1e-6) -> bool:
+    """允许已有违规逐步改善，但禁止新违规或违规程度增加。"""
+    def key(violation):
+        return (violation["type"], violation.get("bus_id"), violation.get("line_id"))
+
+    previous = {key(item): item for item in before.get("violations", [])}
+    for item in after.get("violations", []):
+        old = previous.get(key(item))
+        if old is None:
+            return False
+        if item["type"] == "voltage_low":
+            if item["value"] + tolerance < old["value"]:
+                return False
+        elif item["value"] > old["value"] + tolerance:
+            return False
+    return True
 
 
 # ============================================================
@@ -324,11 +352,14 @@ def get_tool_catalog(net, available_tools: list, target_buses: list = None) -> d
             if not valid_targets or int(row.from_bus) in nearby or int(row.to_bus) in nearby
         ],
         "generators": [
-            {"gen_id": int(i), "bus_id": int(row.bus)}
+            {"gen_id": int(i), "bus_id": int(row.bus),
+             "vm_pu": round(float(row.vm_pu), 4), "p_mw": round(float(row.p_mw), 4)}
             for i, row in net.gen.iterrows()
         ],
-        "action_example": {"tool": "simulate_action", "params": {
-            "action": {"type": "set_gen_voltage", "gen_id": 0, "vm_pu": 1.04}
+        "bus_voltages": {int(i): round(float(vm), 4) for i, vm in net.res_bus.vm_pu.items()},
+        "current_violations": check_constraints(net)["violations"],
+        "action_format": {"tool": "simulate_action", "params": {
+            "action": {"type": "set_gen_voltage", "gen_id": "整数发电机ID", "vm_pu": "数值设定值"}
         }},
     }
 
@@ -450,8 +481,14 @@ def call_tool(tool_name: str, net, **kwargs) -> dict:
     - 补全缺失的必需参数
     - 对无参数工具直接清空参数
     """
+    global _illegal_tool_calls
+    permission = kwargs.pop("permission", None)
     if tool_name not in TOOL_REGISTRY:
+        _illegal_tool_calls += 1
         return {"success": False, "error": f"工具 '{tool_name}' 不存在"}
+    if permission is not None and tool_name not in get_available_tools(permission):
+        _illegal_tool_calls += 1
+        return {"success": False, "error": f"工具 '{tool_name}' 不在当前权限内"}
 
     context = kwargs.pop("context", "")
     cleaned = clean_tool_params(tool_name, kwargs, context)

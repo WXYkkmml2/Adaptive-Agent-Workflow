@@ -20,6 +20,7 @@ class PowerNetwork:
     """
 
     def __init__(self):
+        self.mutation_history = []
         # 加载 IEEE 14-bus 标准网络
         # pandapower 的网络加载函数在不同版本中命名不同，
         # 以项目虚拟环境中的可用函数为准。
@@ -147,6 +148,7 @@ class PowerNetwork:
             raise ValueError(f"发电机 {gen_id} 不存在")
         self.net.gen.at[gen_id, "p_mw"] = p_mw
         self._run_power_flow()
+        self.mutation_history.append(("set_gen_output", gen_id, p_mw))
 
     def set_gen_voltage(self, gen_id: int, vm_pu: float):
         """设置发电机电压设定值，然后重新计算潮流。"""
@@ -154,6 +156,7 @@ class PowerNetwork:
             raise ValueError(f"发电机 {gen_id} 不存在")
         self.net.gen.at[gen_id, "vm_pu"] = vm_pu
         self._run_power_flow()
+        self.mutation_history.append(("set_gen_voltage", gen_id, vm_pu))
 
     def set_line_status(self, line_id: int, in_service: bool):
         """投入/退出某条线路，然后重新计算潮流。"""
@@ -161,9 +164,11 @@ class PowerNetwork:
             raise ValueError(f"线路 {line_id} 不存在")
         self.net.line.at[line_id, "in_service"] = in_service
         self._run_power_flow()
+        self.mutation_history.append(("set_line_status", line_id, in_service))
 
     def reset(self):
         """重置网络到初始状态。"""
+        self.mutation_history.clear()
         self.net = pn.case14()
         try:
             if "gen" in self.net and not self.net.gen.empty:

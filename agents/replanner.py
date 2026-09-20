@@ -26,12 +26,14 @@ class Replanner:
         d0_info: dict,
         certainty: float,
         tree_depth: int,
+        permission_shrink: bool = True,
     ):
         self.network = network
         self.llm = llm
         self.d0_info = d0_info
         self.certainty = certainty
         self.tree_depth = tree_depth
+        self.permission_shrink = permission_shrink
 
     def handle_failure(
         self,
@@ -117,7 +119,7 @@ class Replanner:
         "不管哪种情况，树的其他路径完全不受影响，继续运行。"
         """
         task_permission = Permission.from_task(task)
-        child_permission = parent_permission.intersect(task_permission)
+        child_permission = parent_permission.intersect(task_permission) if self.permission_shrink else Permission.root_permission()
 
         agent_id = f"orch_replan_{task.id}_attempt{attempt}"
 
@@ -134,6 +136,7 @@ class Replanner:
             certainty=self.certainty,
             is_replan=True,
             failure_info=failure_context,
+            permission_shrink=self.permission_shrink,
         )
 
         return orch_agent.execute()

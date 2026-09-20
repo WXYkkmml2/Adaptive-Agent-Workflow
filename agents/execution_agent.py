@@ -70,9 +70,10 @@ class ExecutionAgent:
             logger.info(f"{indent}  ⚠ 高风险操作，需要人工确认（MVP 中自动通过）")
 
         if strategy == "simulate":
+            self._simulation_error = "仿真验证未通过"
             sim_ok = self._simulate_first(tool_sequence)
             if not sim_ok:
-                return self._fail("仿真验证未通过")
+                return self._fail(self._simulation_error)
 
         return self._execute_tools(tool_sequence)
 
@@ -89,9 +90,11 @@ class ExecutionAgent:
             return {"success": False, "error": "指令缺少 tool 字段"}
 
         if tool_name not in TOOL_REGISTRY:
+            call_tool(tool_name, self.network.net, permission=self.permission.to_dict())
             return {"success": False, "error": f"工具 '{tool_name}' 不存在", "available_tools": available}
 
         if tool_name not in available:
+            call_tool(tool_name, self.network.net, permission=self.permission.to_dict())
             return {
                 "success": False,
                 "error": f"工具 '{tool_name}' 不在当前权限对应的 available_tools 中",
@@ -151,22 +154,28 @@ class ExecutionAgent:
         
         MVP 简化：直接在副本上试跑，检查约束是否满足。
         """
-        from grid.tools import simulate_action, check_constraints
+        from grid.tools import simulate_action, check_constraints, constraints_not_worse
 
         for call in tool_sequence:
             tool_name = call.get("tool", "")
             params = call.get("params", {})
 
             if tool_name == "simulate_action":
-                result = simulate_action(self.network.net, params.get("action", params))
+                action = params.get("action", params)
+                result = simulate_action(self.network.net, action)
                 if not result.get("success", False):
+                    self._simulation_error = f"仿真失败: action={action}, error={result.get('error')}"
                     logger.warning(f"  仿真失败: {result.get('error', '未知')}")
                     return False
                 # 在仿真副本上检查约束
                 sim_net = result.get("net_copy")
                 if sim_net is not None:
                     constraints = check_constraints(sim_net)
-                    if not constraints["all_satisfied"]:
+                    before = check_constraints(self.network.net)
+                    if not constraints_not_worse(before, constraints):
+                        self._simulation_error = (f"仿真验证未通过: action={action}, "
+                                                  f"before={before['violations']}, "
+                                                  f"after={constraints['violations']}")
                         logger.warning(f"  仿真约束违规: {constraints['violations']}")
                         return False
 
@@ -175,11 +184,16 @@ class ExecutionAgent:
                 action = {"type": tool_name, **params}
                 result = simulate_action(self.network.net, action)
                 if not result.get("success", False):
+                    self._simulation_error = f"仿真失败: action={action}, error={result.get('error')}"
                     return False
                 sim_net = result.get("net_copy")
                 if sim_net is not None:
                     constraints = check_constraints(sim_net)
-                    if not constraints["all_satisfied"]:
+                    before = check_constraints(self.network.net)
+                    if not constraints_not_worse(before, constraints):
+                        self._simulation_error = (f"仿真验证未通过: action={action}, "
+                                                  f"before={before['violations']}, "
+                                                  f"after={constraints['violations']}")
                         return False
 
         return True
@@ -224,6 +238,7 @@ class ExecutionAgent:
                     tool_name,
                     self.network.net,
                     context=context,
+                    permission=self.permission.to_dict(),
                     **params,
                 )
 

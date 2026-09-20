@@ -63,7 +63,7 @@ ORCHESTRATION_SYSTEM = """你是电力系统调度编排智能体。
 - 查询、分析、评估任务只使用查询或校验工具，不执行修改或仿真动作
 - 执行调压任务只能使用真实存在的发电机，先考虑当前电网状态与物理约束
 - 需要实际恢复电压的执行任务必须包含 set_gen_voltage 等真实修改工具；simulate_action 只修改副本
-- simulate_action 的 params 只能是包含 action 的对象，action 格式参考 action_example
+- simulate_action 的 params 只能是包含 action 的对象，action 格式参考 action_format；其中占位文字必须替换为真实整数和数值
 - 仅输出 JSON：
 {{
   "instructions": [

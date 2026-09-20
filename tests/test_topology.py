@@ -66,7 +66,18 @@ def test_d0_different_buses(net):
 
 
 def test_d0_to_h0_mapping():
-    """D0 → H0 映射应返回合理的层数。"""
-    assert d0_to_h0(0.1) == 3   # 低 D0 → 三层
-    assert d0_to_h0(0.5) == 4   # 中 D0 → 四层
-    assert d0_to_h0(0.8) == 5   # 高 D0 → 五层
+    """D0 翻倍加一层，并遵守最小及最大层数。"""
+    assert d0_to_h0(0.1) == 3
+    assert d0_to_h0(0.5) == 3
+    assert d0_to_h0(1.0) == 3
+    assert d0_to_h0(4.0) == 4
+    assert d0_to_h0(8.0) == 5
+    assert d0_to_h0(0.0) == 3
+
+
+def test_c_does_not_change_depth_until_attention_metric_exists():
+    from agents.planner import Planner
+    from grid.network import PowerNetwork
+    planner = Planner(PowerNetwork(), None)
+    assert planner._compute_tree_depth(4.0, 0.2) == 4
+    assert planner._compute_tree_depth(4.0, 0.9) == 4

@@ -155,3 +155,34 @@ def test_llm_complete_json_returns_structured_error_on_bad_json():
     result = BrokenClient().complete_json("system", "user")
     assert result.get("error") == "LLM_ERROR"
     assert "json" in str(result.get("message", "")).lower()
+
+
+def test_permission_switch_changes_available_tools():
+    from grid.tools import get_available_tools
+    task = Task(id="t1", description="查询母线电压", device_type="bus")
+    narrow = Permission.root_permission().intersect(Permission.from_task(task))
+    assert "get_generator_state" not in get_available_tools(narrow.to_dict())
+    assert "get_generator_state" in get_available_tools(Permission.root_permission().to_dict())
+
+
+def test_full_replan_resets_tasks_and_counts_repeated_calls(monkeypatch):
+    network = PowerNetwork()
+    dag = TaskDAG()
+    dag.add_task(Task(id="t1", description="查询母线电压", devices=[13]))
+    root = RootAgent(network, dag, MockLLMClient(), tree_depth=3,
+                     d0_info={}, certainty=0.8, replan_mode="full")
+    calls = 0
+
+    def dispatch(_task):
+        nonlocal calls
+        calls += 1
+        return {"success": calls > 1, "execution_results": [{
+            "instruction": {"tool": "get_bus_voltage", "params": {"bus_id": 13}},
+            "tool_results": [{"success": True, "tool": "get_bus_voltage"}],
+        }]}
+
+    monkeypatch.setattr(root, "_dispatch_task", dispatch)
+    result = root.execute()
+    assert result["success"] is True
+    assert calls == 2
+    assert result["duplicate_tool_calls"] == 1

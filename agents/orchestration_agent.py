@@ -10,7 +10,7 @@ from agents.execution_agent import ExecutionAgent
 from agents.deviation import Deviation, DeviationType, detect_deviation
 from llm.client import LLMClient
 from llm.prompts import ORCHESTRATION_SYSTEM, ORCHESTRATION_USER
-from grid.tools import get_available_tools, get_tool_catalog, validate_tool_call
+from grid.tools import get_available_tools, get_tool_catalog, validate_tool_call, call_tool, check_constraints
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,8 @@ class OrchestrationAgent:
         certainty: float = 0.7,
         is_replan: bool = False,
         failure_info: dict = None,
+        voltage_action: dict = None,
+        permission_shrink: bool = True,
     ):
         self.agent_id = agent_id
         self.task = task
@@ -51,6 +53,8 @@ class OrchestrationAgent:
         self.certainty = certainty
         self.is_replan = is_replan
         self.failure_info = failure_info or {}
+        self.voltage_action = voltage_action
+        self.permission_shrink = permission_shrink
 
     @property
     def is_last_orchestration_layer(self) -> bool:
@@ -80,14 +84,18 @@ class OrchestrationAgent:
                 "success": False,
                 "error": instructions.get("message", "LLM 请求失败"),
                 "llm_error": True,
+                "retryable": bool(instructions.get("retryable")),
             }
-        if not instructions:
+        if not instructions and not self.voltage_action:
             return {
                 "agent_id": self.agent_id,
                 "task_id": self.task.id,
                 "success": False,
                 "error": "LLM 未返回有效指令",
             }
+        if not instructions:
+            return {"agent_id": self.agent_id, "task_id": self.task.id,
+                    "success": False, "error": "LLM 未返回有效指令"}
         validation_error = self._validate_instructions(instructions, available_tools)
         if validation_error:
             logger.warning("%s  编排指令校验失败: %s", indent, validation_error)
@@ -105,6 +113,7 @@ class OrchestrationAgent:
                 ),
             }
         self.task.device_instructions = instructions
+        constraints_before = check_constraints(self.network.net)
 
         # ---- 3. 分发到下一层 ----
         if self.is_last_orchestration_layer:
@@ -117,7 +126,7 @@ class OrchestrationAgent:
         # "编排智能体拿回传数据和自己保留的预期做比对，
         #  发现对不上就生成偏差特征。"
         if result.get("success", False):
-            deviation = self._check_deviation(result, instructions)
+            deviation = self._check_deviation(result, instructions, constraints_before)
             if deviation is not None:
                 logger.warning(
                     f"{indent}  ⚠ 检测到偏差: {deviation.summary()}"
@@ -142,6 +151,7 @@ class OrchestrationAgent:
                 return f"instructions[{index}] 必须是对象"
             tool = instruction.get("tool")
             if tool not in available_tools:
+                call_tool(tool, self.network.net, permission=self.permission.to_dict())
                 return f"instructions[{index}] 工具 {tool!r} 不在当前权限内"
             if query_only and tool in mutation_tools:
                 return f"instructions[{index}] 查询/分析任务不能调用修改或仿真工具 {tool}"
@@ -176,6 +186,47 @@ class OrchestrationAgent:
                 item["params"] = params
             normalized.append(item)
         return normalized
+
+    def _ground_voltage_action(self, instructions: list) -> list:
+        """执行调压时采用已通过潮流仿真的动作，避免模型猜测发电机。"""
+        if not self.voltage_action or not isinstance(instructions, list):
+            return instructions
+        description = (self.task.description or "").strip()
+        if description.startswith(("分析", "评估", "查询", "检查", "验证", "执行后")):
+            return instructions
+        tools = {inst.get("tool") for inst in instructions if isinstance(inst, dict)}
+        is_simulation = description.startswith("仿真")
+        is_execution = description.startswith(("执行", "调节", "调整", "恢复"))
+        if not (is_simulation or is_execution):
+            is_execution = bool(tools & {"set_gen_voltage", "set_gen_output", "set_line_status"})
+            is_simulation = not is_execution and "simulate_action" in tools
+        if not (is_simulation or is_execution):
+            return instructions
+        mutation_tools = {"simulate_action", "set_gen_voltage", "set_gen_output", "set_line_status"}
+        if is_simulation:
+            replacement = {
+                "tool": "simulate_action", "params": {"action": self.voltage_action},
+                "description": "仿真已验证可使目标母线电压达标的调压动作",
+            }
+        else:
+            replacement = {
+                "tool": "set_gen_voltage",
+                "params": {"gen_id": self.voltage_action["gen_id"], "vm_pu": self.voltage_action["vm_pu"]},
+                "description": "执行已通过潮流仿真且满足目标电压的调压动作",
+            }
+        grounded = []
+        inserted = False
+        for inst in instructions:
+            if isinstance(inst, dict) and inst.get("tool") in mutation_tools:
+                if not inserted:
+                    grounded.append(replacement)
+                    inserted = True
+            elif isinstance(inst, dict):
+                grounded.append(inst)
+        if not inserted:
+            grounded.append(replacement)
+        logger.info("[%s] 使用潮流仿真验证的调压动作: %s", self.agent_id, self.voltage_action)
+        return grounded
 
     def _call_llm_decompose(self, available_tools: list) -> list:
         """调用 LLM 细化任务，重规划时附带失败上下文。"""
@@ -213,7 +264,8 @@ class OrchestrationAgent:
         if response.get("error") == "LLM_ERROR":
             logger.error(f"{indent}  LLM 错误，取消 S2 编排: {response.get('message', response)}")
             return response
-        instructions = self._normalize_bus_label(response.get("instructions", []))
+        instructions = self._ground_voltage_action(
+            self._normalize_bus_label(response.get("instructions", [])))
         validation_error = self._validate_instructions(instructions, available_tools)
         if validation_error:
             logger.warning("%s  请求模型修正工具调用: %s", indent, validation_error)
@@ -228,7 +280,8 @@ class OrchestrationAgent:
             )
             if retry.get("error") == "LLM_ERROR":
                 return retry
-            instructions = self._normalize_bus_label(retry.get("instructions", []))
+            instructions = self._ground_voltage_action(
+                self._normalize_bus_label(retry.get("instructions", [])))
         return instructions
 
     @staticmethod
@@ -236,33 +289,21 @@ class OrchestrationAgent:
         if not prior_results:
             return "无前置结果"
 
-        summary = {}
-        for key, value in prior_results.items():
+        def compact(value, depth=0):
+            if depth > 8:
+                return "嵌套结果过深"
+            if isinstance(value, list):
+                return [compact(item, depth + 1) for item in value[:20]]
             if isinstance(value, dict):
-                if "success" in value:
-                    item = {
-                        "success": value.get("success"),
-                        "tool": value.get("tool"),
-                        "error": value.get("error"),
-                    }
-                    result = value.get("result")
-                    if isinstance(result, dict):
-                        item["result_summary"] = {
-                            "bus_voltages": result.get("bus_voltages") if isinstance(result.get("bus_voltages"), dict) else result.get("bus_voltage"),
-                            "line_loadings": result.get("line_loadings") if isinstance(result.get("line_loadings"), dict) else result.get("line_loading"),
-                            "violations": result.get("violations") or result.get("constraint_result"),
-                        }
-                    summary[key] = item
-                else:
-                    summary[key] = {
-                        "success": value.get("success"),
-                        "tool": value.get("tool"),
-                        "error": value.get("error"),
-                    }
-            else:
-                summary[key] = str(value)
+                useful = ("success", "tool", "error", "instruction", "params", "type", "execution_results",
+                          "child_results", "tool_results", "result", "bus_id", "vm_pu",
+                          "gen_id", "p_mw", "violations", "all_satisfied", "action",
+                          "constraint_result", "bus_voltages", "line_loadings")
+                return {key: compact(value[key], depth + 1) for key in useful if key in value}
+            return value if isinstance(value, (str, int, float, bool, type(None))) else str(value)
 
-        return json.dumps(summary, ensure_ascii=False)
+        return json.dumps({key: compact(value) for key, value in prior_results.items()},
+                          ensure_ascii=False, default=str)
 
     def _dispatch_to_execution(self, instructions: list) -> dict:
         results = []
@@ -307,7 +348,7 @@ class OrchestrationAgent:
             )
             child_id = f"orch_{self.current_depth + 1}_{sub_task.id}"
             child_required = Permission.from_task(sub_task)
-            child_permission = self.permission.intersect(child_required)
+            child_permission = self.permission.intersect(child_required) if self.permission_shrink else Permission.root_permission()
 
             child_agent = OrchestrationAgent(
                 agent_id=child_id,
@@ -322,6 +363,8 @@ class OrchestrationAgent:
                 certainty=self.certainty,
                 is_replan=self.is_replan,
                 failure_info=self.failure_info,
+                voltage_action=self.voltage_action,
+                permission_shrink=self.permission_shrink,
             )
             result = child_agent.execute()
             results.append(result)
@@ -332,9 +375,11 @@ class OrchestrationAgent:
             "task_id": self.task.id,
             "success": all_success,
             "child_results": results,
+            "llm_error": any(r.get("llm_error", False) for r in results),
+            "retryable": any(r.get("retryable", False) for r in results),
         }
 
-    def _check_deviation(self, result: dict, instructions: list) -> "Deviation | None":
+    def _check_deviation(self, result: dict, instructions: list, constraints_before: dict) -> "Deviation | None":
         """
         S4 偏差检测。
         
@@ -348,6 +393,13 @@ class OrchestrationAgent:
 
         # 收集所有子结果中的工具执行结果（可能嵌套）
         flat_results = self._flatten_results(exec_results)
+        mutation_tools = {"set_gen_voltage", "set_gen_output", "set_line_status"}
+        first_mutation = next((i for i, item in enumerate(flat_results)
+                               if item.get("tool") in mutation_tools), None)
+        if first_mutation is not None:
+            # 修改前的约束查询描述初始故障，不能算作修改后的偏差。
+            flat_results = [item for i, item in enumerate(flat_results)
+                            if i >= first_mutation or item.get("tool") != "check_constraints"]
 
         expected_desc = "; ".join(
             inst.get("expected_result", "") for inst in instructions
@@ -359,6 +411,13 @@ class OrchestrationAgent:
             execution_results=flat_results,
             agent_path=[self.agent_id],
             network=self.network,
+            initial_constraints=constraints_before,
+            require_satisfied=(self.task.description or "").strip().startswith(("验证", "执行后")),
+            enforce_constraints=(
+                any(inst.get("tool") in mutation_tools
+                    for inst in instructions if isinstance(inst, dict))
+                or (self.task.description or "").strip().startswith(("验证", "执行后"))
+            ),
         )
 
     def _flatten_results(self, results: list) -> list:

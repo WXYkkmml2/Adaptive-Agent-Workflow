@@ -40,6 +40,8 @@ def main():
         tree_depth=plan["tree_depth"],
         d0_info=plan["d0_info"],
         certainty=plan["certainty"],
+        target_bus=target_bus,
+        min_target_voltage=1.0,
     )
 
     result = root.execute()

@@ -48,7 +48,8 @@ def test_catalog_uses_internal_device_ids():
     network = PowerNetwork()
     catalog = get_tool_catalog(network.net, ["get_line_loading", "set_gen_voltage"])
     assert {"line_id": 11, "from_bus": 8, "to_bus": 13} in catalog["lines"]
-    assert {"gen_id": 0, "bus_id": 5} in catalog["generators"]
+    assert any(g["gen_id"] == 0 and g["bus_id"] == 5 and "vm_pu" in g
+               for g in catalog["generators"])
     assert validate_tool_call("get_line_loading", {"line_id": "8-14"}, network.net)[0] is False
 
 

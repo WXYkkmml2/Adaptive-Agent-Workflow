@@ -12,11 +12,10 @@ import logging
 from grid.network import PowerNetwork
 from grid.topology import compute_d0, d0_to_h0
 from agents.task import Task, TaskDAG, TaskStatus
-from llm.client import LLMClient
+from llm.client import LLMClient, LLMServiceUnavailable
 from llm.prompts import PLANNER_SYSTEM, PLANNER_USER
 from config.settings import (
     BUS_VOLTAGE_MIN, BUS_VOLTAGE_MAX, LINE_LOADING_MAX,
-    C_THRESHOLD_HIGH, C_THRESHOLD_LOW, H_MAX,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,9 +29,12 @@ class Planner:
     输出：PlanResult，包含 G（任务DAG）、C、D0、H
     """
 
-    def __init__(self, network: PowerNetwork, llm: LLMClient):
+    def __init__(self, network: PowerNetwork, llm: LLMClient, depth_mode: str = "adaptive"):
         self.network = network
         self.llm = llm
+        if depth_mode not in ("adaptive", "fixed"):
+            raise ValueError("depth_mode 必须是 adaptive 或 fixed")
+        self.depth_mode = depth_mode
 
     def plan(self, instruction: str) -> dict:
         """
@@ -70,7 +72,7 @@ class Planner:
         logger.info(f"  结构代理指标 C = {certainty:.4f}（非 token/注意力确定性）")
 
         # ---- 5. 确定树深度 H ----
-        tree_depth = self._compute_tree_depth(d0, certainty)
+        tree_depth = 3 if self.depth_mode == "fixed" else self._compute_tree_depth(d0, certainty)
         logger.info(f"  智能体树深度 H = {tree_depth}")
 
         return {
@@ -148,6 +150,8 @@ class Planner:
             max_tokens=2048,
         )
         if response.get("error") == "LLM_ERROR":
+            if response.get("retryable"):
+                raise LLMServiceUnavailable(response.get("message", "LLM 服务暂时不可用"))
             raise RuntimeError(f"任务规划 API 请求失败: {response.get('message', response)}")
 
         # 解析为 TaskDAG
@@ -239,37 +243,5 @@ class Planner:
         return round(min(max(c, 0.0), 1.0), 4)
 
     def _compute_tree_depth(self, d0: float, certainty: float) -> int:
-        """
-        确定智能体树深度 H = f(C, D0)。
-
-        对应原文档：
-        "先将 D0 通过预设区间，映射为基础纵向深度 H0；
-         高 C 时保持 H0；
-         C 中间位置，额外增加编排中间层数量"
-
-        具体逻辑：
-        1. D0 → H0（基础深度）
-        2. C > T1（高确定性）→ H = H0
-        3. T2 < C < T1（中间）→ 按 C 在 [T1,T2] 的位置线性增加层数
-        4. C < T2（低确定性）→ 按文档走独立子树（Step 3 实现），这里先给最大增量
-        """
-        h0 = d0_to_h0(d0)
-
-        if certainty >= C_THRESHOLD_HIGH:
-            # 高确定性，保持基础深度
-            h = h0
-        elif certainty >= C_THRESHOLD_LOW:
-            # 中间区域：C 越低，加越多层
-            # 把 [T1, T2] 等分，C 靠近 T2 加更多层
-            range_size = C_THRESHOLD_HIGH - C_THRESHOLD_LOW
-            position = (C_THRESHOLD_HIGH - certainty) / range_size  # 0~1, 越大越不确定
-            # 最多额外加 2 层
-            extra_layers = round(position * 2)
-            h = h0 + extra_layers
-        else:
-            # 低确定性，给最大增量（实际应拆子树，Step 3 实现）
-            h = h0 + 2
-
-        # 硬上限
-        h = min(h, H_MAX)
-        return h
+        """由 D0 决定深度；C 暂只记录，不参与增层。"""
+        return d0_to_h0(d0)

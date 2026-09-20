@@ -12,6 +12,7 @@ D0 的含义：
 """
 
 import numpy as np
+import math
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import norm as sparse_norm
 import pandapower as pp
@@ -20,7 +21,7 @@ import pandapower.topology as top
 from config.settings import (
     BFS_VOLTAGE_CHANGE_THRESHOLD,
     CONDITION_NUMBER_UPPER_BOUND,
-    D0_TO_H0_MAP,
+    H_MAX,
 )
 
 
@@ -244,14 +245,7 @@ def compute_d0(net, bus_id: int) -> dict:
 
 
 def d0_to_h0(d0: float) -> int:
-    """
-    将 D0 映射为基础树深 H0。
-    
-    对应原文档："先将 D0 通过预设区间，映射为基础纵向深度 H0"
-    映射规则在 config/settings.py 的 D0_TO_H0_MAP 中定义。
-    """
-    for lower, upper, h0 in D0_TO_H0_MAP:
-        if lower <= d0 <= upper:
-            return h0
-    # 超出所有区间，返回最大的 H0
-    return D0_TO_H0_MAP[-1][2]
+    """H = ceil(log2(D0)) + 2，且至少 3 层、至多 H_MAX 层。"""
+    if d0 <= 0:
+        return 3
+    return min(H_MAX, max(3, math.ceil(math.log2(d0)) + 2))

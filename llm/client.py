@@ -4,8 +4,13 @@ import json
 import os
 import re
 import logging
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+
+class LLMServiceUnavailable(RuntimeError):
+    """暂时性的 API 失败；评测不应将其计作方法失败。"""
 
 
 class LLMClient:
@@ -46,6 +51,7 @@ class RealLLMClient(LLMClient):
     """真实 LLM 客户端（可选，需要 API Key）。"""
 
     def __init__(self):
+        self.total_tokens = 0
         # 从环境读取 API Key 并进行容错清洗：去除左右花引号、直引号和首尾空白。
         
         raw_key = os.environ.get("LLM_API_KEY", "")
@@ -61,13 +67,57 @@ class RealLLMClient(LLMClient):
             cleaned = ""
 
         self.api_key = cleaned
-        self.base_url = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com").rstrip("/")
+        raw_base_url = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com").strip()
+        markdown_url = re.fullmatch(r"\[(https?://[^\]]+)\]\((https?://[^)]+)\)", raw_base_url)
+        if markdown_url:
+            if markdown_url.group(1) != markdown_url.group(2):
+                raise ValueError("LLM_BASE_URL 的 Markdown 链接文字与目标地址不一致；请使用纯 URL")
+            raw_base_url = markdown_url.group(2)
+            logger.warning("LLM_BASE_URL 包含 Markdown 链接格式，已提取纯 URL")
+        parsed_base_url = urlparse(raw_base_url)
+        if (parsed_base_url.scheme not in ("http", "https") or not parsed_base_url.netloc
+                or parsed_base_url.query or parsed_base_url.fragment):
+            raise ValueError("LLM_BASE_URL 格式无效；例如 export LLM_BASE_URL='https://api.deepseek.com/v1'")
+        self.base_url = raw_base_url.rstrip("/")
         self.model = os.environ.get("LLM_MODEL", "deepseek-flash")
         if not self.api_key:
             raise ValueError("未设置 LLM_API_KEY")
         if raw_key and raw_key != self.api_key:
             logger.info("检测到并清洗了环境中的 LLM_API_KEY（可能包含不合法引号或空白）")
         logger.info("使用 RealLLMClient: base_url=%s, model=%s", self.base_url, self.model)
+
+    def check_connection(self) -> None:
+        """在批量评测前，用一次小请求检查地址、模型和认证。"""
+        import socket
+        import urllib.error
+        import urllib.request
+        from llm.ssl_utils import get_ssl_context
+
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "请输出 JSON 对象：{\"ok\":true}"}],
+            "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"},
+            "max_tokens": 32,
+        }
+        request = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15, context=get_ssl_context()):
+                pass
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                raise ValueError("LLM API 认证失败 (HTTP 401)；请检查 LLM_API_KEY 的完整内容") from exc
+            if exc.code in (429, 500, 502, 503, 504):
+                raise LLMServiceUnavailable(f"LLM API 暂时不可用 (HTTP {exc.code})；请稍后续跑") from exc
+            raise ValueError(f"LLM API 预检失败 (HTTP {exc.code})；请检查模型名称和服务地址") from exc
+        except urllib.error.URLError as exc:
+            raise LLMServiceUnavailable(f"LLM API 预检网络失败: {exc.reason}") from exc
+        except (socket.timeout, TimeoutError) as exc:
+            raise LLMServiceUnavailable("LLM API 预检超时；请稍后续跑") from exc
 
     def complete(self, system_prompt: str, user_prompt: str, temperature: float = 0.7, source: str = "unknown", max_tokens: int = None) -> str:
         """请求服务端 JSON 模式；返回 JSON 文本，供 complete_json 统一解析。"""
@@ -77,8 +127,9 @@ class RealLLMClient(LLMClient):
         import urllib.request
         from llm.ssl_utils import get_ssl_context
 
-        def error(message: str) -> str:
-            return json.dumps({"error": "LLM_ERROR", "message": message, "source": source}, ensure_ascii=False)
+        def error(message: str, retryable: bool = False) -> str:
+            return json.dumps({"error": "LLM_ERROR", "message": message, "source": source,
+                               "retryable": retryable}, ensure_ascii=False)
 
         payload = {
             "model": self.model,
@@ -91,23 +142,27 @@ class RealLLMClient(LLMClient):
             "thinking": {"type": "disabled"},
             "max_tokens": int(max_tokens) if max_tokens is not None else 2048,
         }
-        request = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"},
-        )
         try:
-            retries = max(1, int(os.environ.get("LLM_MAX_RETRIES", "2")))
+            retries = max(1, int(os.environ.get("LLM_MAX_RETRIES", "3")))
             timeout = max(1, int(os.environ.get("LLM_TIMEOUT", "30")))
         except ValueError:
             return error("LLM_MAX_RETRIES 和 LLM_TIMEOUT 必须为整数")
 
         context = get_ssl_context()
-        for attempt in range(1, retries + 1):
+        token_limit = max(payload["max_tokens"], 8192)
+        attempt = 0
+        while attempt < retries:
+            attempt += 1
+            request = urllib.request.Request(
+                f"{self.base_url}/chat/completions",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"},
+            )
             started = time.perf_counter()
             try:
                 with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
                     data = json.load(response)
+                self.total_tokens += int((data.get("usage") or {}).get("total_tokens") or 0)
                 choices = data.get("choices") or []
                 if not choices:
                     return error("LLM 响应缺少 choices")
@@ -119,6 +174,11 @@ class RealLLMClient(LLMClient):
                         "[LLM] output truncated: source=%s, max_tokens=%s, usage=%s",
                         source, payload["max_tokens"], usage,
                     )
+                    if payload["max_tokens"] < token_limit:
+                        payload["max_tokens"] = min(payload["max_tokens"] * 2, token_limit)
+                        logger.info("[LLM] retrying with max_tokens=%s: source=%s", payload["max_tokens"], source)
+                        attempt -= 1  # A truncated answer does not consume the network retry budget.
+                        continue
                     return error(
                         f"LLM JSON 输出被截断（max_tokens={payload['max_tokens']}, "
                         f"completion_tokens={usage.get('completion_tokens', '未知')}）；"
@@ -140,12 +200,14 @@ class RealLLMClient(LLMClient):
                 message = f"LLM HTTP {exc.code}: {detail}"
                 logger.warning("[LLM] %s: source=%s", message, source)
                 if exc.code not in (429, 500, 502, 503, 504) or attempt == retries:
-                    return error(message)
+                    return error(message, retryable=exc.code in (429, 500, 502, 503, 504))
+                time.sleep(min(2 ** (attempt - 1), 8))
             except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
                 message = f"LLM 网络错误/超时: {exc}"
                 logger.warning("[LLM] %s: source=%s, attempt=%d/%d", message, source, attempt, retries)
                 if attempt == retries:
-                    return error(message)
+                    return error(message, retryable=True)
+                time.sleep(min(2 ** (attempt - 1), 8))
         return error("LLM 调用失败")
 
 

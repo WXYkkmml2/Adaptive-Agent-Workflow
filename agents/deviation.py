@@ -57,6 +57,9 @@ def detect_deviation(
     execution_results: list,
     agent_path: list = None,
     network=None,
+    enforce_constraints: bool = True,
+    initial_constraints: dict | None = None,
+    require_satisfied: bool = False,
 ) -> Optional[Deviation]:
     """
     检测执行结果与预期之间的偏差。
@@ -110,7 +113,11 @@ def detect_deviation(
         tool_result = result.get("result", result.get("tool_results", {}))
         if isinstance(tool_result, dict):
             # check_constraints 返回的结果
-            if "violations" in tool_result and tool_result.get("violation_count", 0) > 0:
+            if enforce_constraints and "violations" in tool_result and tool_result.get("violation_count", 0) > 0:
+                from grid.tools import constraints_not_worse
+                if (initial_constraints is not None and not require_satisfied
+                        and constraints_not_worse(initial_constraints, tool_result)):
+                    continue
                 violations = tool_result["violations"]
                 return Deviation(
                     deviation_type=DeviationType.CONSTRAINT,
@@ -123,7 +130,7 @@ def detect_deviation(
                 )
 
             # simulate_action 返回的结果中嵌套了约束信息
-            if "all_satisfied" in tool_result and not tool_result["all_satisfied"]:
+            if enforce_constraints and "all_satisfied" in tool_result and not tool_result["all_satisfied"]:
                 return Deviation(
                     deviation_type=DeviationType.CONSTRAINT,
                     description="仿真结果显示约束不满足",
