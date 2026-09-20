@@ -46,7 +46,28 @@ class TaskDAG:
     tasks: dict = field(default_factory=dict)  # id → Task
 
     def add_task(self, task: Task):
+        if task.id in self.tasks:
+            raise ValueError(f"重复任务 ID: {task.id}")
         self.tasks[task.id] = task
+
+    def validate(self) -> None:
+        """验证依赖存在且任务图无环。"""
+        state = {}
+
+        def visit(task_id):
+            if state.get(task_id) == 1:
+                raise ValueError(f"任务依赖存在环: {task_id}")
+            if state.get(task_id) == 2:
+                return
+            state[task_id] = 1
+            for dep_id in self.tasks[task_id].dependencies:
+                if dep_id not in self.tasks:
+                    raise ValueError(f"任务 {task_id} 依赖不存在: {dep_id}")
+                visit(dep_id)
+            state[task_id] = 2
+
+        for task_id in self.tasks:
+            visit(task_id)
 
     def get_ready_tasks(self) -> list:
         """
@@ -56,6 +77,7 @@ class TaskDAG:
         "t1 和 t5 之间没有依赖关系，那可以初始时，
          同时激活两个编排智能体分别处理 t1 和 t5"
         """
+        self.validate()
         ready = []
         for task in self.tasks.values():
             if task.status != TaskStatus.PENDING:
@@ -63,7 +85,6 @@ class TaskDAG:
             deps_met = all(
                 self.tasks[dep_id].status == TaskStatus.COMPLETED
                 for dep_id in task.dependencies
-                if dep_id in self.tasks
             )
             if deps_met:
                 ready.append(task)

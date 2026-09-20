@@ -41,9 +41,17 @@ pytest tests/ -v
 Optional real LLM:
 ```bash
 export LLM_API_KEY="your-key"
-export LLM_MODEL="gpt-4o-mini"
+# 默认使用 https://api.deepseek.com 和 deepseek-chat；也可显式设置：
+export LLM_BASE_URL="https://api.deepseek.com"
+export LLM_MODEL="deepseek-chat"
 python main.py
 ```
+
+真实客户端通过 DeepSeek 的 `response_format: {"type":"json_object"}` 直接请求 JSON。
+可用 `LLM_TIMEOUT`（默认 30 秒）和 `LLM_MAX_RETRIES`（默认 2 次）调整超时与重试。
+启动日志会显示实际使用的 `base_url` 和 `model`（不会显示密钥）。若请求失败，
+401 通常检查密钥，400 检查模型与请求参数，429 检查限额或并发，网络超时检查连接。
+规划阶段的 API 错误会直接报出原因，不会被当作空任务列表并继续执行。
 
 ## Project Structure
 
@@ -59,4 +67,3 @@ tests/      Unit + end-to-end tests
 
 MIT
 ```
-

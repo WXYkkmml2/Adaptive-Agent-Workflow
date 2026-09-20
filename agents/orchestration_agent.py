@@ -73,6 +73,14 @@ class OrchestrationAgent:
 
         # ---- 2. 调用 LLM 细化任务 ----
         instructions = self._call_llm_decompose(available_tools)
+        if isinstance(instructions, dict) and instructions.get("error") == "LLM_ERROR":
+            return {
+                "agent_id": self.agent_id,
+                "task_id": self.task.id,
+                "success": False,
+                "error": instructions.get("message", "LLM 请求失败"),
+                "llm_error": True,
+            }
         if not instructions:
             return {
                 "agent_id": self.agent_id,
@@ -80,6 +88,7 @@ class OrchestrationAgent:
                 "success": False,
                 "error": "LLM 未返回有效指令",
             }
+        self.task.device_instructions = instructions
 
         # ---- 3. 分发到下一层 ----
         if self.is_last_orchestration_layer:
@@ -131,6 +140,7 @@ class OrchestrationAgent:
                 f"\n\n【注意：这是重规划。上次失败信息如下】\n"
                 f"失败类型: {self.failure_info.get('previous_failure', {}).get('type', '未知')}\n"
                 f"失败描述: {self.failure_info.get('previous_failure', {}).get('description', '无')}\n"
+                f"相似失败案例使用过的工具: {self.failure_info.get('similar_failed_tools', [])}；请检查失败原因后再选择工具。\n"
                 f"建议: {self.failure_info.get('replan_guidance', '请重新分析')}\n"
             )
 
@@ -146,11 +156,11 @@ class OrchestrationAgent:
             user_prompt,
             temperature=0.2,
             source="orchestration_agent",
-            max_tokens=300,
+            max_tokens=600,
         )
         if response.get("error") == "LLM_ERROR":
             logger.error(f"{indent}  LLM 错误，取消 S2 编排: {response.get('message', response)}")
-            return []
+            return response
         return response.get("instructions", [])
 
     @staticmethod

@@ -201,7 +201,7 @@ class RootAgent:
             return {
                 "success": False,
                 "task_id": task.id,
-                "error": "LLM/API 请求失败，不触发 S4 重规划",
+                "error": result.get("error", "LLM/API 请求失败"),
                 "needs_human": False,
                 "llm_error": True,
                 "deviation": deviation.summary(),

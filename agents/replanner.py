@@ -7,6 +7,7 @@ S4 失效定位与子树重规划。
 
 import logging
 from agents.task import Task
+from agents.anti_example import AntiExampleStore, FailureCase
 from agents.deviation import Deviation, DeviationType
 from agents.permission import Permission
 from agents.orchestration_agent import OrchestrationAgent
@@ -32,6 +33,7 @@ class Replanner:
         self.d0_info = d0_info
         self.certainty = certainty
         self.tree_depth = tree_depth
+        self.anti_example_store = AntiExampleStore()
 
     def handle_failure(
         self,
@@ -68,6 +70,18 @@ class Replanner:
                 "needs_human": False,
                 "llm_error": True,
             }
+
+        if attempt == 1:
+            self.anti_example_store.add_case(FailureCase(
+                case_id=f"fail_{task.id}_{self.anti_example_store.size()}",
+                task_description=task.description,
+                coupling_strength=self.d0_info.get("coupling_strength_a", 0.0),
+                topology_depth=self.d0_info.get("topology_depth_b", 0),
+                certainty=self.certainty,
+                tool_sequence=[inst.get("tool", "") for inst in task.device_instructions if isinstance(inst, dict)],
+                failure_type=deviation.deviation_type.value,
+                context={"description": deviation.description, "actual": deviation.actual},
+            ))
 
         logger.info(
             f"\n[重规划] 任务 {task.id} 第 {attempt} 次重规划"
@@ -182,6 +196,15 @@ class Replanner:
             else:
                 safe_prior[key] = str(value)
 
+        matched = self.anti_example_store.match(
+            task.description,
+            self.d0_info.get("coupling_strength_a", 0.0),
+            self.d0_info.get("topology_depth_b", 0),
+        )
+        failed_tools = sorted({
+            tool for case in matched for tool in case.tool_sequence if tool
+        })
+
         return {
             "is_replan": True,
             "previous_failure": {
@@ -192,6 +215,7 @@ class Replanner:
             },
             "prior_task_results": safe_prior,
             "replan_guidance": self._get_guidance(deviation),
+            "similar_failed_tools": failed_tools,
         }
 
     @staticmethod

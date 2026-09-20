@@ -145,8 +145,10 @@ class Planner:
             user_prompt,
             temperature=0.2,
             source="planner",
-            max_tokens=600,
+            max_tokens=1200,
         )
+        if response.get("error") == "LLM_ERROR":
+            raise RuntimeError(f"任务规划 API 请求失败: {response.get('message', response)}")
 
         # 解析为 TaskDAG
         dag = TaskDAG()
@@ -182,6 +184,8 @@ class Planner:
         if not dag.tasks:
             logger.error("LLM 未返回有效任务，使用降级方案")
             dag = self._fallback_dag(target_bus)
+
+        dag.validate()
 
         return dag
 
