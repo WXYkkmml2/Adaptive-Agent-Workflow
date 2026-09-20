@@ -13,6 +13,7 @@ LLM 提示词模板。
 
 PLANNER_SYSTEM = """你是电力系统调度任务分解专家。
 根据调度指令、目标设备信息和物理约束，将调度任务分解为结构化的任务列表。
+若需改变电网状态，任务图必须包含独立的仿真、执行（如 set_gen_voltage）和执行后验证任务；仿真不修改真实网络。
 初始深度参考值 D0 表示当前任务的物理复杂程度，用于参考任务拆解的细化程度。
 
 仅输出 JSON，不要输出其他任何内容，不要用 markdown 代码块包裹：
@@ -31,11 +32,13 @@ PLANNER_SYSTEM = """你是电力系统调度任务分解专家。
 
 PLANNER_USER = """调度指令: {instruction}
 目标设备: Bus {target_bus}
+注意：上面的 Bus 编号是 pandapower 内部 0-based 索引；IEEE 14-bus 用户编号通常等于内部索引加 1。
 初始深度 D0: {d0:.4f}
 物理约束: 母线电压 [{v_min}, {v_max}] p.u., 线路负载率 < {l_max}%
 当前电网状态摘要:
   目标母线电压: {target_voltage:.4f} p.u.
   邻近母线: {neighbor_buses}
+若当前电压已经满足目标，计划应以确认与校验为主；只有确实需要调节时才创建执行任务。
 请生成调度任务分解方案。"""
 
 # ============================================================
@@ -48,11 +51,19 @@ ORCHESTRATION_SYSTEM = """你是电力系统调度编排智能体。
 可操作设备: {available_devices}
 当前可用工具列表（必须严格从此列表中选择，禁止自行生成工具名或使用不在列表中的工具）：
 {available_tools}
+真实工具参数与设备索引（所有 ID 均为 pandapower 内部 0-based 索引）：
+{tool_catalog}
 
 强制规则：
 - tool 字段的值必须且只能来自 available_tools 中的名称
 - 不得自行生成工具名，也不得使用不存在的工具
-- params 必须与所选工具的参数签名一致
+- params 必须严格使用 tools 对应的 required_params / allowed_params，不得添加别名或额外字段
+- line_id 只能选用 lines 中的整数 ID，不能用 "8-14" 等线路名称或 from_bus/to_bus 代替
+- gen_id 只能选用 generators 中的整数 ID；母线编号不是发电机 ID
+- 查询、分析、评估任务只使用查询或校验工具，不执行修改或仿真动作
+- 执行调压任务只能使用真实存在的发电机，先考虑当前电网状态与物理约束
+- 需要实际恢复电压的执行任务必须包含 set_gen_voltage 等真实修改工具；simulate_action 只修改副本
+- simulate_action 的 params 只能是包含 action 的对象，action 格式参考 action_example
 - 仅输出 JSON：
 {{
   "instructions": [

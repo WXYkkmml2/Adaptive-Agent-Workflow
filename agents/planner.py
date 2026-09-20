@@ -67,7 +67,7 @@ class Planner:
 
         # ---- 4. 计算确定性指标 C ----
         certainty = self._compute_certainty(dag)
-        logger.info(f"  确定性指标 C = {certainty:.4f}")
+        logger.info(f"  结构代理指标 C = {certainty:.4f}（非 token/注意力确定性）")
 
         # ---- 5. 确定树深度 H ----
         tree_depth = self._compute_tree_depth(d0, certainty)
@@ -145,7 +145,7 @@ class Planner:
             user_prompt,
             temperature=0.2,
             source="planner",
-            max_tokens=1200,
+            max_tokens=2048,
         )
         if response.get("error") == "LLM_ERROR":
             raise RuntimeError(f"任务规划 API 请求失败: {response.get('message', response)}")
@@ -171,19 +171,23 @@ class Planner:
                 task_id = f"{base_id}_{counter}"
                 counter += 1
 
+            devices = t_data.get("devices", [target_bus])
+            if not isinstance(devices, list):
+                devices = [target_bus]
+            devices = [target_bus if device == target_bus + 1 and device not in self.network.net.bus.index
+                       else device for device in devices]
             task = Task(
                 id=task_id,
                 description=t_data.get("description", ""),
                 dependencies=t_data.get("dependencies", []),
-                devices=t_data.get("devices", [target_bus]),
+                devices=devices,
                 device_type=t_data.get("device_type", "bus"),
                 voltage_level=t_data.get("voltage_level", "MV"),
             )
             dag.add_task(task)
 
         if not dag.tasks:
-            logger.error("LLM 未返回有效任务，使用降级方案")
-            dag = self._fallback_dag(target_bus)
+            raise ValueError("LLM 未返回有效任务图；请检查规划提示词或模型响应")
 
         dag.validate()
 
@@ -269,23 +273,3 @@ class Planner:
         # 硬上限
         h = min(h, H_MAX)
         return h
-
-    def _fallback_dag(self, target_bus: int) -> TaskDAG:
-        """
-        降级方案：LLM 失败时的最小可用任务 DAG。
-        """
-        dag = TaskDAG()
-        dag.add_task(Task(
-            id="t1", description="查询目标节点电压",
-            devices=[target_bus], device_type="bus",
-        ))
-        dag.add_task(Task(
-            id="t2", description="查询邻近节点状态",
-            devices=[target_bus], device_type="bus",
-        ))
-        dag.add_task(Task(
-            id="t3", description="验证全网约束",
-            dependencies=["t1", "t2"],
-            devices=[target_bus], device_type="bus",
-        ))
-        return dag

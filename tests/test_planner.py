@@ -3,7 +3,7 @@
 import pytest
 import logging
 from grid.network import PowerNetwork
-from llm.client import MockLLMClient
+from tests.fixtures_llm import MockLLMClient
 from agents.planner import Planner
 from agents.root_agent import RootAgent
 from agents.deviation import (

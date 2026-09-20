@@ -35,9 +35,10 @@ def test_deepseek_json_mode(monkeypatch):
     assert len(calls) == 1
     assert calls[0].full_url == "https://api.deepseek.com/chat/completions"
     payload = json.loads(calls[0].data)
-    assert payload["model"] == "deepseek-chat"
+    assert payload["model"] == "deepseek-flash"
     assert payload["response_format"] == {"type": "json_object"}
-    assert payload["max_tokens"] == 1024
+    assert payload["thinking"] == {"type": "disabled"}
+    assert payload["max_tokens"] == 2048
 
 
 def test_auth_error_is_not_retried(monkeypatch):
@@ -54,3 +55,19 @@ def test_auth_error_is_not_retried(monkeypatch):
     assert result["error"] == "LLM_ERROR"
     assert "401" in result["message"]
     assert len(calls) == 1
+
+
+def test_length_error_reports_token_budget(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    client = RealLLMClient()
+
+    def urlopen(request, **kwargs):
+        return FakeResponse({
+            "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+            "usage": {"completion_tokens": 1200},
+        })
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    result = client.complete_json("system", "user", max_tokens=1200)
+    assert result["error"] == "LLM_ERROR"
+    assert "completion_tokens=1200" in result["message"]

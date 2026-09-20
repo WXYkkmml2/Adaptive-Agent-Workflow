@@ -7,10 +7,10 @@ import logging
 from agents.task import Task
 from agents.permission import Permission
 from agents.execution_agent import ExecutionAgent
-from agents.deviation import detect_deviation
+from agents.deviation import Deviation, DeviationType, detect_deviation
 from llm.client import LLMClient
 from llm.prompts import ORCHESTRATION_SYSTEM, ORCHESTRATION_USER
-from grid.tools import get_available_tools
+from grid.tools import get_available_tools, get_tool_catalog, validate_tool_call
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,22 @@ class OrchestrationAgent:
                 "success": False,
                 "error": "LLM 未返回有效指令",
             }
+        validation_error = self._validate_instructions(instructions, available_tools)
+        if validation_error:
+            logger.warning("%s  编排指令校验失败: %s", indent, validation_error)
+            return {
+                "agent_id": self.agent_id,
+                "task_id": self.task.id,
+                "success": False,
+                "error": validation_error,
+                "deviation": Deviation(
+                    deviation_type=DeviationType.PARAMETER,
+                    description="编排模型生成了无效工具调用",
+                    expected="工具参数与设备索引有效",
+                    actual=validation_error,
+                    task_id=self.task.id,
+                ),
+            }
         self.task.device_instructions = instructions
 
         # ---- 3. 分发到下一层 ----
@@ -112,25 +128,62 @@ class OrchestrationAgent:
 
         return result
 
+    def _validate_instructions(self, instructions: list, available_tools: list) -> str | None:
+        if not isinstance(instructions, list):
+            return "instructions 必须是数组"
+        task_description = (self.task.description or "").strip()
+        query_only = task_description.startswith(
+            ("分析", "评估", "查询", "检查", "验证", "执行后验证")
+        )
+        mutation_tools = {"set_gen_voltage", "set_gen_output", "set_line_status", "simulate_action"}
+        actual_mutations = {"set_gen_voltage", "set_gen_output", "set_line_status"}
+        for index, instruction in enumerate(instructions):
+            if not isinstance(instruction, dict):
+                return f"instructions[{index}] 必须是对象"
+            tool = instruction.get("tool")
+            if tool not in available_tools:
+                return f"instructions[{index}] 工具 {tool!r} 不在当前权限内"
+            if query_only and tool in mutation_tools:
+                return f"instructions[{index}] 查询/分析任务不能调用修改或仿真工具 {tool}"
+            ok, error = validate_tool_call(tool, instruction.get("params"), self.network.net)
+            if not ok:
+                return f"instructions[{index}] {tool}: {error}"
+        execution_task = task_description.startswith("执行") and not task_description.startswith("执行后")
+        if execution_task and not any(
+            inst.get("tool") in actual_mutations for inst in instructions
+        ):
+            return "执行任务必须包含真实修改工具；simulate_action 只修改副本"
+        return None
+
+    def _normalize_bus_label(self, instructions: list) -> list:
+        """只把明确指向目标母线的越界用户编号转换为内部索引。"""
+        if not isinstance(instructions, list) or not self.task.devices:
+            return instructions
+        target = self.task.devices[0]
+        if not isinstance(target, int) or target not in self.network.net.bus.index:
+            return instructions
+        normalized = []
+        for instruction in instructions:
+            if not isinstance(instruction, dict):
+                normalized.append(instruction)
+                continue
+            item = dict(instruction)
+            params = item.get("params")
+            if isinstance(params, dict):
+                params = dict(params)
+                if params.get("bus_id") == target + 1 and target + 1 not in self.network.net.bus.index:
+                    params["bus_id"] = target
+                item["params"] = params
+            normalized.append(item)
+        return normalized
+
     def _call_llm_decompose(self, available_tools: list) -> list:
         """调用 LLM 细化任务，重规划时附带失败上下文。"""
-        task_text = (self.task.description or "").lower()
-
-        deterministic_routes = {
-            "查询目标节点电压": [{"tool": "get_bus_voltage", "params": {"bus_id": self.task.devices[0] if self.task.devices else 0}, "description": "查询目标母线电压", "expected_result": "获取电压数据"}],
-            "查询邻近节点状态": [{"tool": "get_neighbor_buses", "params": {"bus_id": self.task.devices[0] if self.task.devices else 0}, "description": "查询相邻母线状态", "expected_result": "获取邻近节点列表"}],
-            "查询线路负载": [{"tool": "get_line_loading", "params": {"line_id": 0}, "description": "查询线路负载率", "expected_result": "获取线路负载数据"}],
-            "验证全网约束": [{"tool": "check_constraints", "params": {}, "description": "校验全网运行约束", "expected_result": "所有母线电压和线路负载率在限值内"}],
-        }
-
-        for key, insts in deterministic_routes.items():
-            if key.lower() in task_text:
-                return insts
-
         system_prompt = ORCHESTRATION_SYSTEM.format(
             permission=self.permission.to_dict(),
             available_devices=self.task.devices,
             available_tools=json.dumps(available_tools, ensure_ascii=False),
+            tool_catalog=json.dumps(get_tool_catalog(self.network.net, available_tools, self.task.devices), ensure_ascii=False),
         )
 
         prior = self._summarize_prior_results(self.prior_results)
@@ -140,7 +193,6 @@ class OrchestrationAgent:
                 f"\n\n【注意：这是重规划。上次失败信息如下】\n"
                 f"失败类型: {self.failure_info.get('previous_failure', {}).get('type', '未知')}\n"
                 f"失败描述: {self.failure_info.get('previous_failure', {}).get('description', '无')}\n"
-                f"相似失败案例使用过的工具: {self.failure_info.get('similar_failed_tools', [])}；请检查失败原因后再选择工具。\n"
                 f"建议: {self.failure_info.get('replan_guidance', '请重新分析')}\n"
             )
 
@@ -156,12 +208,28 @@ class OrchestrationAgent:
             user_prompt,
             temperature=0.2,
             source="orchestration_agent",
-            max_tokens=600,
+            max_tokens=1024,
         )
         if response.get("error") == "LLM_ERROR":
             logger.error(f"{indent}  LLM 错误，取消 S2 编排: {response.get('message', response)}")
             return response
-        return response.get("instructions", [])
+        instructions = self._normalize_bus_label(response.get("instructions", []))
+        validation_error = self._validate_instructions(instructions, available_tools)
+        if validation_error:
+            logger.warning("%s  请求模型修正工具调用: %s", indent, validation_error)
+            retry = self.llm.complete_json(
+                system_prompt,
+                f"任务: {self.task.description}\n目标设备内部索引: {self.task.devices}"
+                f"\n上次工具调用不合法: {validation_error}"
+                "\n请按系统提供的工具参数和设备索引，重新输出最多4条必要的 instructions JSON。",
+                temperature=0.1,
+                source="orchestration_repair",
+                max_tokens=2048,
+            )
+            if retry.get("error") == "LLM_ERROR":
+                return retry
+            instructions = self._normalize_bus_label(retry.get("instructions", []))
+        return instructions
 
     @staticmethod
     def _summarize_prior_results(prior_results: dict) -> str:
@@ -212,12 +280,15 @@ class OrchestrationAgent:
             )
             result = exec_agent.execute()
             results.append(result)
+            if not result.get("success", False):
+                break
 
         all_success = all(r.get("success", False) for r in results)
         return {
             "agent_id": self.agent_id,
             "task_id": self.task.id,
             "success": all_success,
+            "error": next((r.get("error") for r in results if not r.get("success", False)), None),
             "execution_results": results,
             "expected_results": [
                 inst.get("expected_result", "") for inst in instructions

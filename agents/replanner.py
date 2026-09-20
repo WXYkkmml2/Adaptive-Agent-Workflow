@@ -7,7 +7,6 @@ S4 失效定位与子树重规划。
 
 import logging
 from agents.task import Task
-from agents.anti_example import AntiExampleStore, FailureCase
 from agents.deviation import Deviation, DeviationType
 from agents.permission import Permission
 from agents.orchestration_agent import OrchestrationAgent
@@ -33,7 +32,6 @@ class Replanner:
         self.d0_info = d0_info
         self.certainty = certainty
         self.tree_depth = tree_depth
-        self.anti_example_store = AntiExampleStore()
 
     def handle_failure(
         self,
@@ -71,27 +69,11 @@ class Replanner:
                 "llm_error": True,
             }
 
-        if attempt == 1:
-            self.anti_example_store.add_case(FailureCase(
-                case_id=f"fail_{task.id}_{self.anti_example_store.size()}",
-                task_description=task.description,
-                coupling_strength=self.d0_info.get("coupling_strength_a", 0.0),
-                topology_depth=self.d0_info.get("topology_depth_b", 0),
-                certainty=self.certainty,
-                tool_sequence=[inst.get("tool", "") for inst in task.device_instructions if isinstance(inst, dict)],
-                failure_type=deviation.deviation_type.value,
-                context={"description": deviation.description, "actual": deviation.actual},
-            ))
-
         logger.info(
             f"\n[重规划] 任务 {task.id} 第 {attempt} 次重规划"
             f"\n  偏差类型: {deviation.deviation_type.value}"
             f"\n  偏差描述: {deviation.description}"
         )
-
-        if deviation.deviation_type == DeviationType.TOOL_FAULT:
-            logger.info("[重规划] 工具故障，等待后重试")
-            pass
 
         failure_context = self._build_failure_context(task, deviation, prior_results)
 
@@ -109,7 +91,7 @@ class Replanner:
             return result
 
         # 重规划也失败了，递归重试
-        new_deviation = Deviation(
+        new_deviation = result.get("deviation") or Deviation(
             deviation_type=DeviationType.INSUFFICIENT,
             description=f"第 {attempt} 次重规划后仍然失败",
             expected="任务成功完成",
@@ -196,15 +178,6 @@ class Replanner:
             else:
                 safe_prior[key] = str(value)
 
-        matched = self.anti_example_store.match(
-            task.description,
-            self.d0_info.get("coupling_strength_a", 0.0),
-            self.d0_info.get("topology_depth_b", 0),
-        )
-        failed_tools = sorted({
-            tool for case in matched for tool in case.tool_sequence if tool
-        })
-
         return {
             "is_replan": True,
             "previous_failure": {
@@ -214,8 +187,7 @@ class Replanner:
                 "actual": deviation.actual,
             },
             "prior_task_results": safe_prior,
-            "replan_guidance": self._get_guidance(deviation),
-            "similar_failed_tools": failed_tools,
+            "replan_guidance": "请根据上次失败原因修正工具、参数或步骤；不要重复相同调用。",
         }
 
     @staticmethod
@@ -229,16 +201,3 @@ class Replanner:
         if not summary and "vm_pu" in result:
             summary["vm_pu"] = result["vm_pu"]
         return summary
-
-    def _get_guidance(self, deviation: Deviation) -> str:
-        """
-        根据偏差类型生成重规划指导建议。
-        """
-        guidance_map = {
-            DeviationType.PERMISSION: "请检查操作是否在权限范围内，改用有权限的设备或操作。",
-            DeviationType.CONSTRAINT: "上次操作导致约束违规，请采用更保守的调整幅度或分步执行。",
-            DeviationType.PARAMETER: "参数超出设备允许范围，请校验参数有效性。",
-            DeviationType.TOOL_FAULT: "上次工具调用出错，请尝试替代工具或不同调用方式。",
-            DeviationType.INSUFFICIENT: "上次调整幅度不足，请加大调整力度。",
-        }
-        return guidance_map.get(deviation.deviation_type, "请重新分析并生成方案。")

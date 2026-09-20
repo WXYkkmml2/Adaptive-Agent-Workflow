@@ -12,15 +12,17 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 def main():
     network = PowerNetwork()
-    llm = create_llm_client(failure_mode=False)
+    llm = create_llm_client()
 
     print("\n" + "=" * 60)
     print("  场景 A：正常流程")
     print("=" * 60)
 
+    # 示例先制造确实存在的低电压；默认 case14 的 Bus 14 电压本来合格。
+    network.set_gen_voltage(0, 0.98)
     target_bus = 13
     initial_v = network.get_bus_voltage(target_bus)["vm_pu"]
-    print(f"\n初始状态: Bus {target_bus} 电压 = {initial_v:.4f} p.u.")
+    print(f"\n初始状态: Bus 14（内部索引 {target_bus}）电压 = {initial_v:.4f} p.u.")
 
     instruction = "Bus 14 电压过低，请分析并恢复，且不能造成其他节点或线路越限。"
     planner = Planner(network, llm)
@@ -43,10 +45,11 @@ def main():
     result = root.execute()
 
     final_v = network.get_bus_voltage(target_bus)["vm_pu"]
-    print(f"\n  Bus {target_bus} 电压: {initial_v:.4f} → {final_v:.4f} p.u.")
-    print(f"  整体成功: {'✓' if result['success'] else '✗'}")
-
+    print(f"\n  Bus 14 电压: {initial_v:.4f} → {final_v:.4f} p.u.")
+    recovered = final_v >= 1.0
     final_constr = check_constraints(network.net)
+    success = result["success"] and recovered and final_constr["all_satisfied"]
+    print(f"  整体成功: {'✓' if success else '✗'}")
     if final_constr["all_satisfied"]:
         print("  全网约束: ✓ 全部满足")
     else:
@@ -57,7 +60,7 @@ def main():
     print("\n" + "=" * 60)
     print("  结果总结")
     print("=" * 60)
-    print(f"  场景 A (正常): {'✓ 成功' if result['success'] else '✗ 失败'}")
+    print(f"  场景 A (正常): {'✓ 成功' if success else '✗ 失败'}")
 
 
 if __name__ == "__main__":

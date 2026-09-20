@@ -301,6 +301,68 @@ def get_available_tools(permission: dict = None) -> list:
     return available
 
 
+def get_tool_catalog(net, available_tools: list, target_buses: list = None) -> dict:
+    """给编排模型提供真实工具签名和 pandapower 设备索引。"""
+    valid_targets = {i for i in (target_buses or []) if isinstance(i, int) and i in net.bus.index}
+    nearby = set(valid_targets)
+    if valid_targets:
+        for _, row in net.line.iterrows():
+            if int(row.from_bus) in valid_targets or int(row.to_bus) in valid_targets:
+                nearby.update((int(row.from_bus), int(row.to_bus)))
+    return {
+        "tools": {
+            name: {
+                "required_params": sorted(TOOL_REGISTRY[name]["required_params"]),
+                "allowed_params": sorted(TOOL_REGISTRY[name]["allowed_params"]),
+            }
+            for name in available_tools
+        },
+        "bus_ids": [int(i) for i in net.bus.index],
+        "lines": [
+            {"line_id": int(i), "from_bus": int(row.from_bus), "to_bus": int(row.to_bus)}
+            for i, row in net.line.iterrows()
+            if not valid_targets or int(row.from_bus) in nearby or int(row.to_bus) in nearby
+        ],
+        "generators": [
+            {"gen_id": int(i), "bus_id": int(row.bus)}
+            for i, row in net.gen.iterrows()
+        ],
+        "action_example": {"tool": "simulate_action", "params": {
+            "action": {"type": "set_gen_voltage", "gen_id": 0, "vm_pu": 1.04}
+        }},
+    }
+
+
+def validate_tool_call(tool_name: str, params: dict, net) -> tuple:
+    """在执行前校验工具参数和设备索引；不猜测或转换模型生成的 ID。"""
+    if not isinstance(params, dict):
+        return False, "params 必须是 JSON 对象"
+    ok, error = validate_tool_params(tool_name, params)
+    if not ok:
+        return False, error
+    if tool_name not in TOOL_REGISTRY:
+        return False, f"工具 '{tool_name}' 不存在"
+
+    for key, table in (("bus_id", net.bus), ("line_id", net.line), ("gen_id", net.gen)):
+        if key in params:
+            value = params[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value not in table.index:
+                return False, f"{key}={value!r} 不是有效的内部设备索引"
+
+    if tool_name == "simulate_action":
+        action = params["action"]
+        if not isinstance(action, dict):
+            return False, "action 必须是 JSON 对象"
+        action_type = action.get("type")
+        action_tools = {"set_gen_voltage", "set_gen_output", "set_line_status"}
+        if action_type not in action_tools:
+            return False, f"无效 action.type: {action_type!r}"
+        ok, error = validate_tool_call(action_type, {k: v for k, v in action.items() if k != "type"}, net)
+        if not ok:
+            return False, error
+    return True, None
+
+
 def _infer_missing_param(tool_name: str, key: str, context: str = ""):
     """从上下文中尝试补全丢失的必需参数。"""
     if not context:
