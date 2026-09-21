@@ -92,6 +92,7 @@ def run_once(scenario_name: str, config_name: str, repeat: int) -> dict:
             d0 = plan["d0_info"]["d0"]
             root = RootAgent(network, plan["dag"], llm, plan["tree_depth"], plan["d0_info"],
                              plan["certainty"], target_bus=target,
+                             oracle=True,
                              permission_shrink=config["permission_shrink"],
                              replan_mode=config["replan_mode"])
             root_result = root.execute()

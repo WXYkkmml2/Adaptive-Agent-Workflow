@@ -33,6 +33,9 @@ class RootAgent:
         min_target_voltage: float = 1.0,
         permission_shrink: bool = True,
         replan_mode: str = "local",
+        mission: str = "",
+        goal=None,
+        oracle: bool = False,
     ):
         self.network = network
         self.dag = dag
@@ -41,7 +44,11 @@ class RootAgent:
         self.d0_info = d0_info
         self.certainty = certainty
         self.target_bus = target_bus
+        self.oracle = oracle
         self.min_target_voltage = min_target_voltage
+        self.mission = mission
+        self.goal = goal
+        self.shared = {}
         if replan_mode not in ("local", "full"):
             raise ValueError("replan_mode 必须是 local 或 full")
         self.permission_shrink = permission_shrink
@@ -49,7 +56,7 @@ class RootAgent:
         self.duplicate_tool_calls = 0
         self._seen_tool_calls = set()
         self.voltage_action = None
-        if target_bus is not None:
+        if oracle and target_bus is not None:
             from grid.voltage_control import find_voltage_action
             self.voltage_action = find_voltage_action(network.net, target_bus, min_target_voltage)
         self.permission = Permission.root_permission()
@@ -64,10 +71,13 @@ class RootAgent:
             certainty=self.certainty,
             tree_depth=self.tree_depth,
             permission_shrink=self.permission_shrink,
+            mission=self.mission,
+            goal=self.goal,
+            shared=self.shared,
         )
 
     def execute(self) -> dict:
-        if self.target_bus is not None and self.voltage_action is None:
+        if self.oracle and self.target_bus is not None and self.voltage_action is None:
             voltage = self.network.get_bus_voltage(self.target_bus)["vm_pu"]
             if voltage < self.min_target_voltage:
                 logger.error("[根智能体] 未找到同时满足目标电压与全网约束的调压动作")
@@ -121,6 +131,8 @@ class RootAgent:
                             full_restarts += 1
                             self.replan_log.append({"task_id": task.id, "mode": "full", "attempt": full_restarts})
                             self.network.net = copy.deepcopy(initial_net)
+                            self.network.mutation_history.clear()
+                            self.shared.clear()
                             for old_task in self.dag.tasks.values():
                                 old_task.status = TaskStatus.PENDING
                                 old_task.result = None
@@ -128,6 +140,7 @@ class RootAgent:
                             restart_requested = True
                         break
                     replan_result = self._handle_task_failure(task, result)
+                    result["replan_result"] = replan_result
 
                     if replan_result.get("llm_error"):
                         logger.warning(f"[根智能体] 任务失败：LLM/API错误，不触发S4 ({task.id})")
@@ -167,6 +180,10 @@ class RootAgent:
             target_voltage = self.network.get_bus_voltage(self.target_bus)["vm_pu"]
             success = bool(success and target_voltage >= self.min_target_voltage
                            and check_constraints(self.network.net)["all_satisfied"])
+        if self.goal is not None:
+            from grid.goal import goal_status
+            success = bool(success and goal_status(self.network.net, self.goal)["goal_met"]
+                           and len(self.network.action_log) <= self.goal.max_real_actions)
         status_summary = {
             tid: t.status.value for tid, t in self.dag.tasks.items()
         }
@@ -190,7 +207,7 @@ class RootAgent:
         }
 
     def _dispatch_task(self, task) -> dict:
-        task_permission = Permission.from_task(task)
+        task_permission = Permission.from_task(task, self.network.net)
         child_permission = self.permission.intersect(task_permission) if self.permission_shrink else Permission.root_permission()
         agent_id = f"orch_1_{task.id}"
 
@@ -213,6 +230,9 @@ class RootAgent:
             certainty=self.certainty,
             voltage_action=self.voltage_action,
             permission_shrink=self.permission_shrink,
+            mission=self.mission,
+            goal=self.goal,
+            shared=self.shared,
         )
 
         return orch_agent.execute()

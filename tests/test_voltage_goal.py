@@ -30,7 +30,7 @@ def test_wrong_llm_action_is_replaced_by_feasible_voltage_action():
     dag.add_task(Task(id="t2", description="执行调压方案", dependencies=["t1"], devices=[13]))
     dag.add_task(Task(id="t3", description="验证目标电压", dependencies=["t2"], devices=[13]))
     root = RootAgent(network, dag, WrongGeneratorLLM(), tree_depth=3,
-                     d0_info={}, certainty=0.9, target_bus=13)
+                     d0_info={}, certainty=0.9, target_bus=13, oracle=True)
 
     assert root.voltage_action["gen_id"] == 0
     result = root.execute()
@@ -149,7 +149,7 @@ def test_initial_constraint_report_does_not_block_recovery_dag():
                                       "description": "报告约束"}]}
 
     result = RootAgent(network, dag, ReportingLLM(), tree_depth=3,
-                       d0_info={}, certainty=0.8, target_bus=13).execute()
+                       d0_info={}, certainty=0.8, target_bus=13, oracle=True).execute()
     assert result["success"] is True
     assert network.get_bus_voltage(13)["vm_pu"] >= 1.0
 
@@ -233,7 +233,7 @@ def test_pre_action_constraint_check_does_not_fail_successful_adjustment():
     assert network.get_bus_voltage(13)["vm_pu"] >= 1.0
 
 
-def test_two_step_comparison_methods_can_both_solve_feasible_problem(monkeypatch):
+def test_comparison_rejects_partial_plan_before_real_action(monkeypatch):
     import run_compare
 
     class ScriptedLLM:
@@ -265,7 +265,9 @@ def test_two_step_comparison_methods_can_both_solve_feasible_problem(monkeypatch
 
     monkeypatch.setattr(run_compare, "RealLLMClient", ScriptedLLM)
     run_compare.validate_scenario()
-    for method in run_compare.METHODS:
-        row = run_compare.run_once(method, 1)
-        assert row["success"] == 1, (method, row["error"])
-        assert row["action_count"] == 2
+    hierarchical = run_compare.run_once("hierarchical", 1)
+    assert hierarchical["success"] == 0
+    assert hierarchical["action_count"] == 0
+    direct = run_compare.run_once("two_layer", 1)
+    assert direct["success"] == 1, direct["error"]
+    assert direct["action_count"] == 2

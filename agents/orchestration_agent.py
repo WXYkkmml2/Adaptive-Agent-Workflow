@@ -40,6 +40,9 @@ class OrchestrationAgent:
         failure_info: dict = None,
         voltage_action: dict = None,
         permission_shrink: bool = True,
+        mission: str = "",
+        goal=None,
+        shared: dict = None,
     ):
         self.agent_id = agent_id
         self.task = task
@@ -55,6 +58,10 @@ class OrchestrationAgent:
         self.failure_info = failure_info or {}
         self.voltage_action = voltage_action
         self.permission_shrink = permission_shrink
+        self.mission = mission
+        self.goal = goal
+        self.shared = shared if shared is not None else {}
+        self.feedback = ""
 
     @property
     def is_last_orchestration_layer(self) -> bool:
@@ -155,14 +162,15 @@ class OrchestrationAgent:
                 return f"instructions[{index}] 工具 {tool!r} 不在当前权限内"
             if query_only and tool in mutation_tools:
                 return f"instructions[{index}] 查询/分析任务不能调用修改或仿真工具 {tool}"
-            ok, error = validate_tool_call(tool, instruction.get("params"), self.network.net)
+            ok, error = validate_tool_call(tool, instruction.get("params"), self.network.net,
+                                           self.permission.to_dict())
             if not ok:
                 return f"instructions[{index}] {tool}: {error}"
         execution_task = task_description.startswith("执行") and not task_description.startswith("执行后")
         if execution_task and not any(
-            inst.get("tool") in actual_mutations for inst in instructions
+            inst.get("tool") in actual_mutations | {"simulate_action"} for inst in instructions
         ):
-            return "执行任务必须包含真实修改工具；simulate_action 只修改副本"
+            return "执行任务必须给出联合仿真或真实修改方案"
         return None
 
     def _normalize_bus_label(self, instructions: list) -> list:
@@ -238,6 +246,8 @@ class OrchestrationAgent:
         )
 
         prior = self._summarize_prior_results(self.prior_results)
+        if self.feedback:
+            prior += "\n上一轮联合仿真反馈: " + self.feedback
 
         if self.is_replan and self.failure_info:
             prior += (
@@ -251,6 +261,9 @@ class OrchestrationAgent:
             task_description=self.task.description,
             devices=self.task.devices,
             prior_results=prior,
+            mission=self.mission,
+            used=len(self.network.action_log),
+            cap=self.goal.max_real_actions if self.goal else "未指定",
         )
 
         indent = "  " * self.current_depth
@@ -272,6 +285,9 @@ class OrchestrationAgent:
             retry = self.llm.complete_json(
                 system_prompt,
                 f"任务: {self.task.description}\n目标设备内部索引: {self.task.devices}"
+                f"\n全局指令与验收标准: {self.mission}"
+                f"\n已用真实调整次数: {len(self.network.mutation_history)}/{self.goal.max_real_actions if self.goal else '未指定'}"
+                f"\n上一轮仿真反馈: {self.feedback}"
                 f"\n上次工具调用不合法: {validation_error}"
                 "\n请按系统提供的工具参数和设备索引，重新输出最多4条必要的 instructions JSON。",
                 temperature=0.1,
@@ -298,7 +314,8 @@ class OrchestrationAgent:
                 useful = ("success", "tool", "error", "instruction", "params", "type", "execution_results",
                           "child_results", "tool_results", "result", "bus_id", "vm_pu",
                           "gen_id", "p_mw", "violations", "all_satisfied", "action",
-                          "constraint_result", "bus_voltages", "line_loadings")
+                          "constraint_result", "bus_voltages", "line_loadings",
+                          "goal_met", "goal_bus_vm", "goal_shortfall", "violation_count")
                 return {key: compact(value[key], depth + 1) for key in useful if key in value}
             return value if isinstance(value, (str, int, float, bool, type(None))) else str(value)
 
@@ -306,6 +323,84 @@ class OrchestrationAgent:
                           ensure_ascii=False, default=str)
 
     def _dispatch_to_execution(self, instructions: list) -> dict:
+        if self.goal is None:
+            return self._dispatch_raw(instructions)
+        mutations = {"set_gen_voltage", "set_gen_output", "set_line_status"}
+        wants_commit = any(i["tool"] in mutations for i in instructions) or (
+            self.task.description.strip().startswith("执行") and
+            any(i["tool"] == "simulate_action" for i in instructions))
+        if not wants_commit and not any(i["tool"] == "simulate_action" for i in instructions):
+            return self._dispatch_raw(instructions)
+        from grid.tools import simulate_action, validate_tool_call
+        from agents.deviation import Deviation, DeviationType
+
+        attempts = []
+        for round_number in range(3):
+            simulations = [i for i in instructions if i["tool"] == "simulate_action"]
+            proposed = [i for i in instructions if i["tool"] in mutations]
+            branch_plans = self.shared.setdefault("verified_plan", {})
+            if wants_commit and self.task.id in branch_plans and self.shared.get("verified_at", {}).get(self.task.id) == len(self.network.action_log):
+                actions = branch_plans[self.task.id]
+            elif simulations:
+                actions = simulations[-1]["params"]["action"]
+            else:
+                actions = [{"type": i["tool"], **i["params"]} for i in proposed]
+            if isinstance(actions, dict):
+                actions = [actions]
+            ok, error = validate_tool_call("simulate_action", {"action": actions}, self.network.net,
+                                           self.permission.to_dict())
+            if not ok:
+                return self._goal_failure(attempts, error)
+            if len(actions) + len(self.network.action_log) > self.goal.max_real_actions:
+                feedback = {"goal_met": False, "budget_error": "真实调整次数将超过上限"}
+            else:
+                feedback = simulate_action(self.network.net, actions, self.goal, len(self.network.action_log))
+                if feedback.get("success") and not feedback.get("not_worse", True):
+                    feedback["goal_met"] = False
+            attempts.append({"instruction": {"tool": "simulate_action", "params": {"action": actions}},
+                             "tool_results": [{"tool": "simulate_action", "success": feedback.get("success", False),
+                                               "result": {k: v for k, v in feedback.items() if k != "net_copy"}}]})
+            if feedback.get("goal_met"):
+                branch_plans[self.task.id] = actions
+                self.shared.setdefault("verified_at", {})[self.task.id] = len(self.network.action_log)
+                if not wants_commit:
+                    return {"agent_id": self.agent_id, "task_id": self.task.id, "success": True,
+                            "execution_results": attempts}
+                committed = self._dispatch_raw([
+                    {"tool": a["type"], "params": {k: v for k, v in a.items() if k != "type"},
+                     "description": "执行已通过联合仿真的方案", "expected_result": self.mission}
+                    for a in actions])
+                committed["execution_results"] = attempts + committed["execution_results"]
+                from grid.goal import goal_status
+                if not committed["success"] or not goal_status(self.network.net, self.goal)["goal_met"]:
+                    committed["success"] = False
+                    committed["error"] = committed.get("error") or "提交后目标未达标"
+                branch_plans.pop(self.task.id, None)
+                self.shared.get("verified_at", {}).pop(self.task.id, None)
+                return committed
+            if round_number == 2:
+                break
+            self.feedback = json.dumps({k: v for k, v in feedback.items()
+                                        if k not in ("net_copy", "bus_voltages", "line_loadings")},
+                                       ensure_ascii=False, default=str)
+            instructions = self._call_llm_decompose(get_available_tools(self.permission.to_dict()))
+            if isinstance(instructions, dict) and instructions.get("error") == "LLM_ERROR":
+                return {"agent_id": self.agent_id, "task_id": self.task.id, "success": False,
+                        "error": instructions.get("message"), "llm_error": True,
+                        "retryable": bool(instructions.get("retryable")), "execution_results": attempts}
+            error = self._validate_instructions(instructions, get_available_tools(self.permission.to_dict()))
+            if error:
+                return self._goal_failure(attempts, error)
+        return self._goal_failure(attempts, self.feedback or "联合仿真未达目标")
+
+    def _goal_failure(self, attempts, message):
+        deviation = Deviation(DeviationType.INSUFFICIENT, "联合仿真未达验收标准",
+                              "目标母线和全网约束达标", str(message), task_id=self.task.id)
+        return {"agent_id": self.agent_id, "task_id": self.task.id, "success": False,
+                "error": deviation.description + ": " + str(message), "deviation": deviation,
+                "execution_results": attempts}
+
+    def _dispatch_raw(self, instructions: list) -> dict:
         results = []
         for i, inst in enumerate(instructions):
             exec_id = f"exec_{self.task.id}_{i}"
@@ -318,6 +413,7 @@ class OrchestrationAgent:
                 d0_info=self.d0_info,
                 certainty=self.certainty,
                 depth=self.current_depth + 1,
+                goal=self.goal,
             )
             result = exec_agent.execute()
             results.append(result)
@@ -365,6 +461,9 @@ class OrchestrationAgent:
                 failure_info=self.failure_info,
                 voltage_action=self.voltage_action,
                 permission_shrink=self.permission_shrink,
+                mission=self.mission,
+                goal=self.goal,
+                shared=self.shared,
             )
             result = child_agent.execute()
             results.append(result)

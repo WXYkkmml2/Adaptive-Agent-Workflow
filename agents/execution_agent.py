@@ -36,6 +36,7 @@ class ExecutionAgent:
         d0_info: dict = None,
         certainty: float = 0.7,
         depth: int = 2,
+        goal=None,
     ):
         self.agent_id = agent_id
         self.instruction = instruction  # 编排层下发的设备级指令
@@ -45,6 +46,7 @@ class ExecutionAgent:
         self.d0_info = d0_info or {}
         self.certainty = certainty
         self.depth = depth
+        self.goal = goal
 
     def execute(self) -> dict:
         """
@@ -162,7 +164,7 @@ class ExecutionAgent:
 
             if tool_name == "simulate_action":
                 action = params.get("action", params)
-                result = simulate_action(self.network.net, action)
+                result = simulate_action(self.network.net, action, self.goal)
                 if not result.get("success", False):
                     self._simulation_error = f"仿真失败: action={action}, error={result.get('error')}"
                     logger.warning(f"  仿真失败: {result.get('error', '未知')}")
@@ -182,7 +184,7 @@ class ExecutionAgent:
             elif tool_name in ("set_gen_voltage", "set_gen_output", "set_line_status"):
                 # 把修改类操作包装成 simulate_action 来验证
                 action = {"type": tool_name, **params}
-                result = simulate_action(self.network.net, action)
+                result = simulate_action(self.network.net, action, self.goal)
                 if not result.get("success", False):
                     self._simulation_error = f"仿真失败: action={action}, error={result.get('error')}"
                     return False
@@ -216,6 +218,10 @@ class ExecutionAgent:
             # （在 MVP 中"真实网络"就是 pandapower 的 net 对象）
             context = self.instruction.get("description", "")
             if tool_name in ("set_gen_voltage", "set_gen_output", "set_line_status"):
+                if self.goal and len(self.network.action_log) >= self.goal.max_real_actions:
+                    results.append({"success": False, "tool": tool_name,
+                                    "error": "真实调整次数已达上限"})
+                    break
                 # 修改类操作：先校验参数名，再调用 network 方法修改真实网络
                 ok, err = validate_tool_params(tool_name, params, context=context)
                 if not ok:
@@ -224,7 +230,13 @@ class ExecutionAgent:
                     try:
                         cleaned = params.copy()
                         if tool_name == "set_gen_voltage":
-                            self.network.set_gen_voltage(**cleaned)
+                            feedback = self.network.set_gen_voltage(**cleaned)
+                            actual = self.network.get_generator_state(cleaned["gen_id"])["vm_pu"]
+                            if abs(actual - cleaned["vm_pu"]) > 1e-3:
+                                result = {"success": False, "tool": tool_name, "result": feedback,
+                                          "error": f"PARAMETER 偏差: 期望 {cleaned['vm_pu']}，实际 {actual}"}
+                                results.append(result)
+                                break
                         elif tool_name == "set_gen_output":
                             self.network.set_gen_output(**cleaned)
                         elif tool_name == "set_line_status":
@@ -241,6 +253,14 @@ class ExecutionAgent:
                     permission=self.permission.to_dict(),
                     **params,
                 )
+                if tool_name == "simulate_action" and result.get("success") and self.goal:
+                    from grid.goal import goal_status
+                    from grid.tools import check_constraints, constraints_not_worse
+                    sim_net = result.get("result", {}).get("net_copy")
+                    if sim_net is not None:
+                        result["result"].update(goal_status(sim_net, self.goal))
+                        result["result"]["not_worse"] = constraints_not_worse(
+                            check_constraints(self.network.net), check_constraints(sim_net))
 
             logger.info(
                 f"{indent}  工具 {tool_name}: "

@@ -1,5 +1,0 @@
-method,repeat,success,physical_success,workflow_success,action_count,actions,illegal_tool_calls,duplicate_tool_calls,total_tokens,elapsed_seconds,final_bus14_voltage,tree_depth,d0,replan_count,failed_tasks,error
-hierarchical,1,0,0,0,0,[],0,0,15108,26.709,0.88324,3,0.2,1,"t2,t3,t4,t5,t6",t2: 仿真验证未通过
-two_layer,1,0,0,0,0,[],0,0,4871,8.681,0.88324,2,,0,direct,仿真验证未通过
-two_layer,2,0,0,0,0,[],0,0,4990,9.304,0.88324,2,,0,direct,仿真验证未通过
-hierarchical,2,0,0,0,0,[],0,0,9843,17.001,0.88324,3,0.2,1,"t2,t3,t4,t5,t6",t2: 仿真验证未通过

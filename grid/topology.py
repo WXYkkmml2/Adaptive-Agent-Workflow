@@ -249,3 +249,81 @@ def d0_to_h0(d0: float) -> int:
     if d0 <= 0:
         return 3
     return min(H_MAX, max(3, math.ceil(math.log2(d0)) + 2))
+
+
+def compute_regional_d0(net, target_bus: int) -> dict:
+    """Physical D0 for case39: relative 1 MW decay and local Ybus condition."""
+    import copy
+    import networkx as nx
+    from config.settings import CASE39_DECAY_EPS, CASE39_MAX_B
+
+    graph = top.create_nxgraph(net, respect_switches=True)
+    distances = nx.single_source_shortest_path_length(graph, target_bus, cutoff=CASE39_MAX_B)
+    changed = copy.deepcopy(net)
+    pp.create_load(changed, bus=target_bus, p_mw=1.0, q_mvar=0.0)
+    pp.runpp(changed, algorithm="nr", init="results")
+    delta = {int(i): abs(float(changed.res_bus.at[i, "vm_pu"] - net.res_bus.at[i, "vm_pu"]))
+             for i in distances}
+    first = max((delta[i] for i, hop in distances.items() if hop == 1), default=0.0)
+    b = 1
+    for hop in range(1, CASE39_MAX_B + 1):
+        layer = [delta[i] for i, depth in distances.items() if depth == hop]
+        if not layer:
+            break
+        b = hop
+        if first and max(layer) / first < CASE39_DECAY_EPS:
+            break
+    buses = get_neighbor_buses(net, target_bus, depth=b)
+    lookup = net._pd2ppc_lookups["bus"]
+    indices = sorted({int(lookup[i]) for i in buses if int(lookup[i]) >= 0})
+    ybus = net._ppc["internal"]["Ybus"]
+    matrix = ybus[indices, :][:, indices].toarray()
+    kappa = float(np.linalg.cond(matrix)) if len(indices) > 1 else 1.0
+    d0 = max(math.log10(kappa), b) if math.isfinite(kappa) else float("inf")
+    return {"bus_id": target_bus, "topology_depth_b": b, "condition_number": kappa,
+            "network_diameter": nx.diameter(graph), "d0": d0,
+            "first_hop_change": first, "voltage_changes": delta}
+
+
+def regional_scope(net, target_buses: list[int], forbidden_regions=()) -> dict:
+    """Reachable buses and responsive generators, excluding forbidden operating zones."""
+    import copy
+    from config.settings import CASE39_INFLUENCE_RATIO
+    info = [compute_regional_d0(net, bus) for bus in target_buses]
+    buses = set()
+    for result in info:
+        threshold = CASE39_INFLUENCE_RATIO * result["first_hop_change"]
+        buses.update(i for i, change in result["voltage_changes"].items() if change >= threshold)
+        buses.add(result["bus_id"])
+    forbidden = {int(i) for i in forbidden_regions}
+    buses = {i for i in buses if int(net.bus.at[i, "zone"]) not in forbidden}
+    responses = {}
+    for gen_id in net.gen.index:
+        bus = int(net.gen.at[gen_id, "bus"])
+        if int(net.bus.at[bus, "zone"]) in forbidden:
+            continue
+        changed = copy.deepcopy(net)
+        changed.gen.at[gen_id, "vm_pu"] += .02
+        pp.runpp(changed, algorithm="nr", init="results")
+        responses[int(gen_id)] = max(abs(float(changed.res_bus.at[target, "vm_pu"] - net.res_bus.at[target, "vm_pu"]))
+                                     for target in target_buses)
+    peak = max(responses.values(), default=0.0)
+    gens = {i for i, response in responses.items() if response >= CASE39_INFLUENCE_RATIO * peak}
+    lines = {int(i) for i, row in net.line.iterrows()
+             if int(row.from_bus) in buses and int(row.to_bus) in buses}
+    trafos = {int(i) for i, row in net.trafo.iterrows()
+              if int(row.hv_bus) in buses and int(row.lv_bus) in buses}
+    return {"bus": buses, "gen": gens, "line": lines, "trafo": trafos, "d0_info": info}
+
+
+def regional_tree_depth(scope: dict, net) -> int:
+    from config.settings import CASE39_H_MAX
+    info = scope["d0_info"]
+    b = max(item["topology_depth_b"] for item in info)
+    diameter = max(item["network_diameter"] for item in info)
+    h0 = 3 + round((CASE39_H_MAX - 3) * b / diameter)
+    zones = {int(net.bus.at[i, "zone"]) for i in scope["bus"]}
+    levels = {"HV" if net.bus.at[i, "vn_kv"] >= 100 else "MV" if net.bus.at[i, "vn_kv"] >= 10 else "LV"
+              for i in scope["bus"]}
+    l = int(len(zones) > 1) + int(len(levels) > 1)
+    return min(h0, CASE39_H_MAX, 2 + l)

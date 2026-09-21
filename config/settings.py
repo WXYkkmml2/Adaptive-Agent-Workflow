@@ -12,6 +12,14 @@ CONDITION_NUMBER_UPPER_BOUND = 500.0
 
 H_MAX = 7
 
+# case39 regional restoration experiment (fixed before evaluation)
+CASE39_DECAY_EPS = 0.10
+CASE39_INFLUENCE_RATIO = 0.15
+CASE39_H_MAX = 5
+CASE39_DTH = 1.0
+CASE39_MAX_B = 8
+CASE39_TEMPERATURE = 0.2
+
 # ============================================================
 # 确定性指标 C 的阈值
 # ============================================================

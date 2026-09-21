@@ -1,4 +1,4 @@
-"""比较分层方法与直接编排→执行方法在双发电机恢复任务上的表现。"""
+"""Legacy case14 smoke comparison; not the case39 regional evaluation."""
 
 import argparse
 import copy
@@ -17,6 +17,7 @@ from agents.planner import Planner
 from agents.root_agent import RootAgent
 from agents.task import Task
 from grid.network import PowerNetwork
+from grid.goal import Goal
 from grid.tools import check_constraints, get_tool_counters, reset_tool_counters
 from llm.client import LLMServiceUnavailable, RealLLMClient
 
@@ -37,9 +38,10 @@ FIELDS = ["method", "repeat", "success", "physical_success", "workflow_success",
 
 def make_network() -> PowerNetwork:
     network = PowerNetwork()
-    network.set_gen_voltage(0, 0.90)
-    network.set_gen_voltage(3, 0.90)
-    network.mutation_history.clear()  # 场景注入不算代理动作。
+    # 评测注入直接作用于初始断面，不经过真实动作接口。
+    network.net.gen.at[0, "vm_pu"] = 0.90
+    network.net.gen.at[3, "vm_pu"] = 0.90
+    network._run_power_flow()
     if check_constraints(network.net)["all_satisfied"]:
         raise ValueError("比较场景的初始状态没有违规")
     return network
@@ -69,7 +71,7 @@ def collect_proposed_actions(value) -> list[dict]:
                 "simulate_action", "set_gen_voltage", "set_gen_output", "set_line_status"
             }:
                 actions.append({"tool": instruction["tool"], "params": instruction.get("params", {})})
-            for key in ("result", "execution_log", "execution_results", "child_results"):
+            for key in ("result", "execution_log", "execution_results", "child_results", "replan_result"):
                 if key in node:
                     visit(node[key])
     visit(value)
@@ -94,13 +96,15 @@ def run_once(method: str, repeat: int) -> dict:
     proposed_actions = []
     try:
         network = make_network()
+        goal = Goal.from_instruction(INSTRUCTION, 13)
         llm = RealLLMClient()
         if method == "hierarchical":
             plan = Planner(network, llm).plan(INSTRUCTION)
             tree_depth = plan["tree_depth"]
             d0 = plan["d0_info"]["d0"]
             root = RootAgent(network, plan["dag"], llm, tree_depth, plan["d0_info"],
-                             plan["certainty"], permission_shrink=True, replan_mode="local")
+                             plan["certainty"], permission_shrink=True, replan_mode="local",
+                             mission=plan["instruction"], goal=goal)
             result = root.execute()
             proposed_actions = collect_proposed_actions(result)
             if any(entry["result"].get("retryable") for entry in result["execution_log"]):
@@ -120,6 +124,7 @@ def run_once(method: str, repeat: int) -> dict:
                                                           devices=[13], device_type="bus"),
                 permission=Permission.root_permission(), network=network, llm=llm,
                 current_depth=0, max_depth=2, permission_shrink=False,
+                mission=INSTRUCTION, goal=goal,
             )
             result = agent.execute()
             proposed_actions = collect_proposed_actions(result)
@@ -161,6 +166,7 @@ def run_once(method: str, repeat: int) -> dict:
 
 
 def print_summary(rows: list[dict]) -> None:
+    print("仅为 case14 冒烟诊断；不能作为 case39 分区域恢复的公平方法比较。")
     print("\n方法 | 严格成功 | 物理达标 | 流程完成 | token | 耗时(s)")
     print("--- | ---: | ---: | ---: | ---: | ---:")
     for method in METHODS:
@@ -174,7 +180,7 @@ def print_summary(rows: list[dict]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--output", type=Path, default=Path("compare_two_step.csv"))
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()

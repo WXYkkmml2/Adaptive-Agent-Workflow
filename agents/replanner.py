@@ -27,6 +27,9 @@ class Replanner:
         certainty: float,
         tree_depth: int,
         permission_shrink: bool = True,
+        mission: str = "",
+        goal=None,
+        shared: dict = None,
     ):
         self.network = network
         self.llm = llm
@@ -34,6 +37,9 @@ class Replanner:
         self.certainty = certainty
         self.tree_depth = tree_depth
         self.permission_shrink = permission_shrink
+        self.mission = mission
+        self.goal = goal
+        self.shared = shared if shared is not None else {}
 
     def handle_failure(
         self,
@@ -78,6 +84,8 @@ class Replanner:
         )
 
         failure_context = self._build_failure_context(task, deviation, prior_results)
+        self.shared.pop("verified_plan", None)
+        self.shared.pop("verified_at", None)
 
         # ---- 4. 在失效节点重新实例化编排智能体 ----
         # 对应原文档：
@@ -137,6 +145,9 @@ class Replanner:
             is_replan=True,
             failure_info=failure_context,
             permission_shrink=self.permission_shrink,
+            mission=self.mission,
+            goal=self.goal,
+            shared=self.shared,
         )
 
         return orch_agent.execute()

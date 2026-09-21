@@ -22,6 +22,7 @@ class Permission:
     regions: set = field(default_factory=lambda: {"all"})
     voltage_levels: set = field(default_factory=lambda: {"HV", "MV", "LV"})
     device_types: set = field(default_factory=lambda: {"bus", "line", "gen", "trafo", "switch", "load"})
+    scope: dict = field(default_factory=dict)
 
     def intersect(self, child_required: "Permission") -> "Permission":
         """
@@ -45,6 +46,10 @@ class Permission:
             regions=new_regions,
             voltage_levels=new_vl,
             device_types=new_dt,
+            scope={key: (self.scope[key] & child_required.scope[key]
+                         if key in self.scope and key in child_required.scope
+                         else set(self.scope.get(key, child_required.scope.get(key, set()))))
+                   for key in self.scope.keys() | child_required.scope.keys()},
         )
 
     def covers_device_type(self, device_type: str) -> bool:
@@ -55,6 +60,7 @@ class Permission:
             "regions": sorted(self.regions),
             "voltage_levels": sorted(self.voltage_levels),
             "device_types": sorted(self.device_types),
+            "scope": {key: sorted(value) for key, value in self.scope.items()},
         }
 
     @staticmethod
@@ -67,20 +73,29 @@ class Permission:
         )
 
     @staticmethod
-    def from_task(task) -> "Permission":
+    def from_task(task, net=None) -> "Permission":
         """
         根据任务涉及的设备，推导出该任务所需的最小权限。
         在 IEEE 14-bus 中简化处理：所有设备都在同一区域。
         """
         device_types = {"bus", "line", "trafo"}
+        if task.device_type == "gen" or not (task.description or "").strip().startswith(("查询", "检查", "验证")):
+            device_types.add("gen")
         if task.device_type:
             device_types.add(task.device_type)
         description = (task.description or "").strip()
         if description.startswith(("仿真", "执行", "调整", "调节", "恢复")) or "发电机" in description:
             device_types.add("gen")
 
-        return Permission(
-            regions={"ieee14"},
-            voltage_levels={task.voltage_level} if task.voltage_level else {"MV"},
-            device_types=device_types,
-        )
+        if net is None:
+            return Permission(regions={"all"}, device_types=device_types)
+        buses = {int(i) for i in task.devices if i in net.bus.index}
+        gens = {int(i) for i in task.devices if i in net.gen.index and task.device_type == "gen"}
+        buses.update(int(net.gen.at[i, "bus"]) for i in gens)
+        scope = {"bus": buses} if buses else {}
+        if task.device_type == "gen":
+            scope["gen"] = gens
+        regions = {str(int(net.bus.at[i, "zone"])) for i in buses} or {"all"}
+        levels = {"HV" if net.bus.at[i, "vn_kv"] >= 100 else "MV" if net.bus.at[i, "vn_kv"] >= 10 else "LV" for i in buses}
+        return Permission(regions=regions, voltage_levels=levels or {"HV", "MV", "LV"},
+                          device_types=device_types, scope=scope)

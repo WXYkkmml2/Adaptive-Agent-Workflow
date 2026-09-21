@@ -64,6 +64,7 @@ ORCHESTRATION_SYSTEM = """你是电力系统调度编排智能体。
 - 执行调压任务只能使用真实存在的发电机，先考虑当前电网状态与物理约束
 - 需要实际恢复电压的执行任务必须包含 set_gen_voltage 等真实修改工具；simulate_action 只修改副本
 - simulate_action 的 params 只能是包含 action 的对象，action 格式参考 action_format；其中占位文字必须替换为真实整数和数值
+- 多台设备需联合达标时，把全部动作放进同一个 simulate_action 的 action 列表联合仿真；只有联合仿真 goal_met=true 的方案才可真实执行
 - 仅输出 JSON：
 {{
   "instructions": [
@@ -80,6 +81,8 @@ ORCHESTRATION_SYSTEM = """你是电力系统调度编排智能体。
 ORCHESTRATION_USER = """任务: {task_description}
 涉及设备: {devices}
 前置任务结果: {prior_results}
+【全局指令与验收标准，所有任务必须遵守】{mission}
+已用真实调整次数: {used}/{cap}
 请生成设备级执行指令。"""
 
 # ============================================================

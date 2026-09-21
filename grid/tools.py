@@ -96,7 +96,7 @@ def get_generator_state(net, gen_id: int) -> dict:
     }
 
 
-def simulate_action(net, action: dict) -> dict:
+def simulate_action(net, action: dict | list, goal=None, used_actions=0) -> dict:
     """
     在网络副本上执行操作并返回仿真结果。
         
@@ -110,19 +110,19 @@ def simulate_action(net, action: dict) -> dict:
     # 在深拷贝上操作，不影响原始网络
     net_copy = copy.deepcopy(net)
 
-    action_type = action.get("type")
-
-    if action_type == "set_gen_output":
-        net_copy.gen.at[action["gen_id"], "p_mw"] = action["p_mw"]
-
-    elif action_type == "set_gen_voltage":
-        net_copy.gen.at[action["gen_id"], "vm_pu"] = action["vm_pu"]
-
-    elif action_type == "set_line_status":
-        net_copy.line.at[action["line_id"], "in_service"] = action["in_service"]
-
-    else:
-        return {"success": False, "error": f"未知操作类型: {action_type}"}
+    actions = action if isinstance(action, list) else [action]
+    if not actions:
+        return {"success": False, "error": "action 不能为空"}
+    for item in actions:
+        action_type = item.get("type")
+        if action_type == "set_gen_output":
+            net_copy.gen.at[item["gen_id"], "p_mw"] = item["p_mw"]
+        elif action_type == "set_gen_voltage":
+            net_copy.gen.at[item["gen_id"], "vm_pu"] = item["vm_pu"]
+        elif action_type == "set_line_status":
+            net_copy.line.at[item["line_id"], "in_service"] = item["in_service"]
+        else:
+            return {"success": False, "error": f"未知操作类型: {action_type}"}
 
     # 在副本上跑潮流
     try:
@@ -134,13 +134,21 @@ def simulate_action(net, action: dict) -> dict:
             "action": action,
         }
 
-    return {
+    result = {
         "success": True,
         "action": action,
         "bus_voltages": net_copy.res_bus["vm_pu"].to_dict(),
         "line_loadings": net_copy.res_line["loading_percent"].to_dict(),
         "net_copy": net_copy,  # 返回副本，供后续决策使用
     }
+    if goal is not None:
+        from grid.goal import goal_status
+        result.update(goal_status(net_copy, goal))
+        result["not_worse"] = constraints_not_worse(check_constraints(net), check_constraints(net_copy))
+        if used_actions + len(actions) > goal.max_real_actions:
+            result["goal_met"] = False
+            result["budget_error"] = f"方案含 {len(actions)} 个动作，已用 {used_actions}，上限 {goal.max_real_actions}"
+    return result
 
 
 def check_constraints(net) -> dict:
@@ -257,7 +265,7 @@ TOOL_REGISTRY = {
         "func": simulate_action,
         "description": "在仿真副本上执行操作并返回结果",
         "device_types": {"bus", "line", "gen", "trafo"},
-        "risk_level": "medium",
+        "risk_level": "low",
         "requires_net_arg": True,
         "allowed_params": {"action"},
         "required_params": {"action"},
@@ -329,7 +337,7 @@ def get_available_tools(permission: dict = None) -> list:
     return available
 
 
-def get_tool_catalog(net, available_tools: list, target_buses: list = None) -> dict:
+def get_tool_catalog(net, available_tools: list, target_buses: list = None, permission=None) -> dict:
     """给编排模型提供真实工具签名和 pandapower 设备索引。"""
     valid_targets = {i for i in (target_buses or []) if isinstance(i, int) and i in net.bus.index}
     nearby = set(valid_targets)
@@ -337,6 +345,9 @@ def get_tool_catalog(net, available_tools: list, target_buses: list = None) -> d
         for _, row in net.line.iterrows():
             if int(row.from_bus) in valid_targets or int(row.to_bus) in valid_targets:
                 nearby.update((int(row.from_bus), int(row.to_bus)))
+    scope = (permission or {}).get("scope", {})
+    def permitted(kind, index):
+        return kind not in scope or int(index) in scope[kind]
     return {
         "tools": {
             name: {
@@ -345,26 +356,26 @@ def get_tool_catalog(net, available_tools: list, target_buses: list = None) -> d
             }
             for name in available_tools
         },
-        "bus_ids": [int(i) for i in net.bus.index],
+        "bus_ids": [int(i) for i in net.bus.index if permitted("bus", i)],
         "lines": [
             {"line_id": int(i), "from_bus": int(row.from_bus), "to_bus": int(row.to_bus)}
             for i, row in net.line.iterrows()
-            if not valid_targets or int(row.from_bus) in nearby or int(row.to_bus) in nearby
+            if permitted("line", i) and (not valid_targets or int(row.from_bus) in nearby or int(row.to_bus) in nearby)
         ],
         "generators": [
             {"gen_id": int(i), "bus_id": int(row.bus),
              "vm_pu": round(float(row.vm_pu), 4), "p_mw": round(float(row.p_mw), 4)}
-            for i, row in net.gen.iterrows()
+            for i, row in net.gen.iterrows() if permitted("gen", i)
         ],
         "bus_voltages": {int(i): round(float(vm), 4) for i, vm in net.res_bus.vm_pu.items()},
         "current_violations": check_constraints(net)["violations"],
         "action_format": {"tool": "simulate_action", "params": {
-            "action": {"type": "set_gen_voltage", "gen_id": "整数发电机ID", "vm_pu": "数值设定值"}
+            "action": [{"type": "set_gen_voltage", "gen_id": "整数发电机ID", "vm_pu": "数值设定值"}]
         }},
     }
 
 
-def validate_tool_call(tool_name: str, params: dict, net) -> tuple:
+def validate_tool_call(tool_name: str, params: dict, net, permission=None) -> tuple:
     """在执行前校验工具参数和设备索引；不猜测或转换模型生成的 ID。"""
     if not isinstance(params, dict):
         return False, "params 必须是 JSON 对象"
@@ -379,18 +390,27 @@ def validate_tool_call(tool_name: str, params: dict, net) -> tuple:
             value = params[key]
             if isinstance(value, bool) or not isinstance(value, int) or value not in table.index:
                 return False, f"{key}={value!r} 不是有效的内部设备索引"
+            scope = (permission or {}).get("scope", {})
+            kind = key.removesuffix("_id")
+            if kind in scope and value not in scope[kind]:
+                global _illegal_tool_calls
+                _illegal_tool_calls += 1
+                return False, f"{key}={value} 超出权限范围"
 
     if tool_name == "simulate_action":
         action = params["action"]
-        if not isinstance(action, dict):
-            return False, "action 必须是 JSON 对象"
-        action_type = action.get("type")
-        action_tools = {"set_gen_voltage", "set_gen_output", "set_line_status"}
-        if action_type not in action_tools:
-            return False, f"无效 action.type: {action_type!r}"
-        ok, error = validate_tool_call(action_type, {k: v for k, v in action.items() if k != "type"}, net)
-        if not ok:
-            return False, error
+        actions = action if isinstance(action, list) else [action]
+        if not actions:
+            return False, "action 不能为空"
+        for item in actions:
+            if not isinstance(item, dict):
+                return False, "action 中每个动作必须是 JSON 对象"
+            action_type = item.get("type")
+            if action_type not in {"set_gen_voltage", "set_gen_output", "set_line_status"}:
+                return False, f"无效 action.type: {action_type!r}"
+            ok, error = validate_tool_call(action_type, {k: v for k, v in item.items() if k != "type"}, net, permission)
+            if not ok:
+                return False, error
     return True, None
 
 
@@ -520,6 +540,8 @@ def call_tool(tool_name: str, net, **kwargs) -> dict:
                     cleaned[key] = val - 1
 
         result = func(net, **cleaned)
+        if isinstance(result, dict) and result.get("success") is False:
+            return {"success": False, "tool": tool_name, "error": result.get("error"), "result": result}
         return {"success": True, "tool": tool_name, "result": result}
     except Exception as e:
         return {"success": False, "tool": tool_name, "error": str(e)}
