@@ -73,7 +73,7 @@ class Permission:
         )
 
     @staticmethod
-    def from_task(task, net=None) -> "Permission":
+    def from_task(task, net=None, forbidden_regions=None) -> "Permission":
         """
         根据任务涉及的设备，推导出该任务所需的最小权限。
         在 IEEE 14-bus 中简化处理：所有设备都在同一区域。
@@ -89,7 +89,24 @@ class Permission:
 
         if net is None:
             return Permission(regions={"all"}, device_types=device_types)
-        buses = {int(i) for i in task.devices if i in net.bus.index}
+        if forbidden_regions is not None:
+            from grid.topology import regional_scope
+            buses = Permission.task_buses(task, net)
+            if not buses:
+                raise ValueError("Task has no physical scope")
+            scope = regional_scope(net, sorted(buses), forbidden_regions)
+            regions = {int(net.bus.at[b, "zone"]) for b in buses} - set(forbidden_regions)
+            # Region ownership plus physical influence: no cross-region device leakage.
+            for kind in ("bus", "gen", "line", "trafo"):
+                def zones(i):
+                    if kind == "bus": return {int(net.bus.at[i, "zone"])}
+                    cols = {"gen": ("bus",), "line": ("from_bus", "to_bus"), "trafo": ("hv_bus", "lv_bus")}[kind]
+                    return {int(net.bus.at[int(net[kind].at[i, c]), "zone"]) for c in cols}
+                scope[kind] = {i for i in scope[kind] if zones(i) <= regions}
+            return Permission(regions={str(z) for z in regions},
+                              device_types={"bus", "gen", "line", "trafo"},
+                              scope={k: scope[k] for k in ("bus", "gen", "line", "trafo")})
+        buses = Permission.task_buses(task, net)
         gens = {int(i) for i in task.devices if i in net.gen.index and task.device_type == "gen"}
         buses.update(int(net.gen.at[i, "bus"]) for i in gens)
         scope = {"bus": buses} if buses else {}
@@ -99,3 +116,13 @@ class Permission:
         levels = {"HV" if net.bus.at[i, "vn_kv"] >= 100 else "MV" if net.bus.at[i, "vn_kv"] >= 10 else "LV" for i in buses}
         return Permission(regions=regions, voltage_levels=levels or {"HV", "MV", "LV"},
                           device_types=device_types, scope=scope)
+
+    @staticmethod
+    def task_buses(task, net):
+        """Device IDs are typed: generator/line indices are never bus indices."""
+        kind = task.device_type or "bus"
+        if kind == "bus":
+            return {int(i) for i in task.devices if i in net.bus.index}
+        cols = {"gen": ("bus",), "load": ("bus",),
+                "line": ("from_bus", "to_bus"), "trafo": ("hv_bus", "lv_bus")}.get(kind, ())
+        return {int(net[kind].at[i, col]) for i in task.devices if i in net[kind].index for col in cols}

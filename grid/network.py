@@ -53,7 +53,7 @@ class PowerNetwork:
         潮流计算的结果会写入 net.res_bus, net.res_line 等表。
         如果不收敛，抛出异常——这意味着当前网络状态有严重问题。
         """
-        pp.runpp(self.net, algorithm="nr", init="results")
+        pp.runpp(self.net, algorithm="nr", init="results", numba=False)
 
     def get_snapshot(self):
         """

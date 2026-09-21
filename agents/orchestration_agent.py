@@ -43,6 +43,7 @@ class OrchestrationAgent:
         mission: str = "",
         goal=None,
         shared: dict = None,
+        kernel=None,
     ):
         self.agent_id = agent_id
         self.task = task
@@ -62,12 +63,16 @@ class OrchestrationAgent:
         self.goal = goal
         self.shared = shared if shared is not None else {}
         self.feedback = ""
+        self.kernel = kernel
+        self.replan_mode = "local"
 
     @property
     def is_last_orchestration_layer(self) -> bool:
         return self.current_depth >= self.max_depth - 2
 
     def execute(self) -> dict:
+        if self.kernel is not None:
+            return self._execute_joint()
         indent = "  " * self.current_depth
         replan_tag = " [重规划]" if self.is_replan else ""
         logger.info(
@@ -532,3 +537,53 @@ class OrchestrationAgent:
             else:
                 flat.append(r)
         return flat
+
+    def propose_joint(self):
+        """Depth determines actual delegation, with a single common leaf prompt."""
+        if self.is_last_orchestration_layer:
+            return self.kernel.ask(self.task, self.permission)
+        return self._joint_child().propose_joint()
+
+    def _joint_child(self):
+        children = self.__dict__.setdefault("joint_children", {})
+        if self.task.id not in children:
+            children[self.task.id] = OrchestrationAgent(
+                self.agent_id + "/" + self.task.id, self.task, self.permission, self.network, self.llm,
+                self.current_depth + 1, self.max_depth, permission_shrink=self.permission_shrink,
+                mission=self.mission, goal=self.goal, kernel=self.kernel)
+        return children[self.task.id]
+
+    def commit_joint(self, actions):
+        if not self.is_last_orchestration_layer:
+            return self._joint_child().commit_joint(actions)
+        for index, action in enumerate(actions):
+            agent = ExecutionAgent(self.agent_id + f"/exec{index}", action, self.permission,
+                                   self.network, self.llm, depth=self.max_depth - 1,
+                                   goal=self.goal, kernel=self.kernel)
+            result = agent.execute()
+            if not result.get("success"):
+                return result
+        return {"success": True}
+
+    def _execute_joint(self):
+        """Whole-plan baseline, bounded by the same global attempt budget as Root."""
+        from config.settings import CASE39_MAX_ATTEMPTS
+        for attempt in range(1, CASE39_MAX_ATTEMPTS + 1):
+            self.kernel.attempts = attempt
+            if attempt > 1:
+                self.kernel.replanned.append(self.task.id)
+                if self.replan_mode == "full":
+                    self.kernel.rollback()
+            try:
+                actions = self.propose_joint()
+                gate = self.kernel.joint_gate(actions)
+                if not gate.get("goal_met"):
+                    self.kernel.failure(json.dumps(gate, ensure_ascii=False))
+                    continue
+                result = self.commit_joint(actions)
+                if result.get("success") and self.kernel.success():
+                    return {"success": True}
+                self.kernel.failure(result.get("error") or "真实执行后全网未达标")
+            except ValueError as exc:
+                self.kernel.failure(str(exc))
+        return {"success": False, "error": self.kernel.feedback}

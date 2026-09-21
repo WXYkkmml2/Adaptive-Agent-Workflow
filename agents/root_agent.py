@@ -36,7 +36,9 @@ class RootAgent:
         mission: str = "",
         goal=None,
         oracle: bool = False,
+        kernel=None,
     ):
+        self.kernel = kernel
         self.network = network
         self.dag = dag
         self.llm = llm
@@ -77,6 +79,8 @@ class RootAgent:
         )
 
     def execute(self) -> dict:
+        if self.kernel is not None:
+            return self._execute_joint()
         if self.oracle and self.target_bus is not None and self.voltage_action is None:
             voltage = self.network.get_bus_voltage(self.target_bus)["vm_pu"]
             if voltage < self.min_target_voltage:
@@ -322,3 +326,83 @@ class RootAgent:
         })
 
         return replan_result
+
+    def _joint_agent(self, task, permission=None):
+        if permission is None:
+            permission = (self.permission.intersect(Permission.from_task(task, self.network.net, self.goal.forbidden_regions))
+                          if self.permission_shrink else Permission.root_permission())
+        branch = next(tuple(ids) for ids in self.partitions if task.id in ids)
+        if branch not in self.branch_agents:
+            self.branch_agents[branch] = OrchestrationAgent(
+                "regional/" + "/".join(branch), task, permission, self.network, self.llm, 1, self.tree_depth,
+                permission_shrink=self.permission_shrink, mission=self.mission, goal=self.goal,
+                kernel=self.kernel)
+        agent = self.branch_agents[branch]
+        agent.task, agent.permission = task, permission
+        return agent
+
+    def _execute_joint(self):
+        """Stage the DAG, gate its joint plan, then commit only dependency-ready tasks."""
+        from agents.regional import partition_dag
+        from config.settings import CASE39_MAX_ATTEMPTS
+        self.partitions = partition_dag(self.dag, self.network.net)
+        order = [tid for group in self.partitions for tid in group]
+        self.joint_plans, self.joint_agents, self.branch_agents = {}, {}, {}
+        self.joint_permissions = {}
+        failed = None
+        for attempt in range(1, CASE39_MAX_ATTEMPTS + 1):
+            self.kernel.attempts = attempt
+            if attempt > 1:
+                if self.replan_mode == "full":
+                    self.kernel.rollback()
+                    self.kernel.replanned.append("all")
+                    self.joint_plans.clear()
+                    self.joint_agents.clear()
+                    self.joint_permissions.clear()
+                    self.branch_agents.clear()
+                    for task in self.dag.tasks.values():
+                        task.status, task.result = TaskStatus.PENDING, None
+                elif failed is not None:
+                    self.replanner.rebuild_joint(self, failed)
+                else:
+                    # Joint simulation failure has no unique physical culprit.
+                    for tid in order:
+                        if self.dag.tasks[tid].status != TaskStatus.COMPLETED:
+                            self.replanner.rebuild_joint(self, tid)
+            failed = None
+            try:
+                pending = [tid for tid in order if self.dag.tasks[tid].status != TaskStatus.COMPLETED]
+                for tid in pending:
+                    if tid not in self.joint_plans:
+                        failed = tid
+                        agent = self._joint_agent(self.dag.tasks[tid])
+                        self.joint_agents[tid] = agent
+                        self.joint_permissions[tid] = agent.permission
+                        self.joint_plans[tid] = agent.propose_joint()
+                failed = None
+                actions = [action for tid in pending for action in self.joint_plans[tid]]
+                gate = self.kernel.joint_gate(actions)
+                if not gate.get("goal_met"):
+                    self.kernel.failure(json.dumps(gate, ensure_ascii=False))
+                    continue
+                for tid in pending:
+                    task = self.dag.tasks[tid]
+                    if not all(self.dag.tasks[d].status == TaskStatus.COMPLETED for d in task.dependencies):
+                        raise ValueError("Dependent task is waiting for failed predecessor")
+                    task.status = TaskStatus.ACTIVE
+                    result = self._joint_agent(task, self.joint_permissions[tid]).commit_joint(self.joint_plans[tid])
+                    if not result.get("success"):
+                        failed = tid
+                        task.status = TaskStatus.FAILED
+                        self.kernel.failure(result.get("error", "执行失败"))
+                        break
+                    task.status, task.result = TaskStatus.COMPLETED, result
+                if failed is None:
+                    if self.kernel.success():
+                        return {"success": True}
+                    self.kernel.failure("真实执行后全网未达标")
+                    # Do not silently create recovery tasks for an inadequate DAG.
+                    return {"success": False, "error": self.kernel.feedback}
+            except ValueError as exc:
+                self.kernel.failure(str(exc))
+        return {"success": False, "error": self.kernel.feedback}

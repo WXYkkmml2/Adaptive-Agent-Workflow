@@ -126,7 +126,7 @@ def simulate_action(net, action: dict | list, goal=None, used_actions=0) -> dict
 
     # 在副本上跑潮流
     try:
-        pp.runpp(net_copy, algorithm="nr", init="results")
+        pp.runpp(net_copy, algorithm="nr", init="results", numba=False)
     except pp.powerflow.LoadflowNotConverged:
         return {
             "success": False,
@@ -545,3 +545,9 @@ def call_tool(tool_name: str, net, **kwargs) -> dict:
         return {"success": True, "tool": tool_name, "result": result}
     except Exception as e:
         return {"success": False, "tool": tool_name, "error": str(e)}
+
+
+def record_illegal_call():
+    """Count a strict boundary rejection that did not reach a registered tool."""
+    global _illegal_tool_calls
+    _illegal_tool_calls += 1

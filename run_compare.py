@@ -53,7 +53,7 @@ def validate_scenario() -> None:
     witness = copy.deepcopy(network.net)
     witness.gen.at[0, "vm_pu"] = 1.04
     witness.gen.at[3, "vm_pu"] = 1.04
-    pp.runpp(witness, algorithm="nr", init="results")
+    pp.runpp(witness, algorithm="nr", init="results", numba=False)
     if witness.res_bus.at[13, "vm_pu"] < 1.0 or not check_constraints(witness)["all_satisfied"]:
         raise ValueError("比较场景未找到已验证的两动作可行解")
 
@@ -136,7 +136,7 @@ def run_once(method: str, repeat: int) -> dict:
         else:
             raise ValueError(f"未知方法: {method}")
 
-        pp.runpp(network.net, algorithm="nr", init="results")
+        pp.runpp(network.net, algorithm="nr", init="results", numba=False)
         final_voltage = round(float(network.net.res_bus.at[13, "vm_pu"]), 6)
         physical_success = bool(final_voltage >= 1.0 and check_constraints(network.net)["all_satisfied"])
     except LLMServiceUnavailable as exc:

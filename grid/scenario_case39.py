@@ -40,7 +40,7 @@ def validate_scenario():
     witness = copy.deepcopy(network.net)
     for gen_id, vm in ((0, .98), (6, .98), (1, 1.06)):
         witness.gen.at[gen_id, "vm_pu"] = vm
-    pp.runpp(witness, algorithm="nr", init="results")
+    pp.runpp(witness, algorithm="nr", init="results", numba=False)
     assert goal_status(witness, goal)["goal_met"]
     assert constraints_not_worse(initial, goal_status(witness, goal))
     assert len(network.action_log) == 0

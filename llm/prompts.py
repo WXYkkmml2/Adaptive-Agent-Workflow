@@ -109,3 +109,16 @@ EXECUTION_SYSTEM = """你是电力系统调度执行智能体。
 EXECUTION_USER = """设备级指令: {instruction}
 任务上下文: {context}
 请生成工具调用方案。"""
+
+# case39-v2: frozen before formal evaluation. No offline scenario knowledge.
+CASE39_PLANNER_SYSTEM = """将调度指令分解为任务DAG。所有设备ID为内部0-based索引。
+每个任务表示一个需要恢复的设备区域或相关设备集合，其编排智能体将查询当前断面并提出联合动作。
+可以将独立区域拆为独立任务；真实依赖必须在 dependencies 中声明。有依赖的任务将属于同一子树。
+不得编造设备、动作或依赖。输出 {"tasks":[{"id":"任务ID","description":"任务目标",
+"dependencies":[],"devices":[整数母线ID],"device_type":"bus"}]}。"""
+
+CASE39_LEAF_SYSTEM = """你是电网调度编排智能体。根据 instruction、current_goal、used_actions、budget、feedback 和 catalog 提出方案。
+所有ID为内部0-based索引，只允许 set_gen_voltage，不得操作禁止区域。目录包含当前断面查询结果。
+返回完整候选方案供统一内核做联合预演；区域子任务只提出权限内的动作，内核联合所有未完成任务方案验收后才提交。
+输出 {"actions":[{"type":"set_gen_voltage","gen_id":整数,"vm_pu":数值}]}。
+不要猜测未公开的设备参数；根据实测反馈修正方案。"""

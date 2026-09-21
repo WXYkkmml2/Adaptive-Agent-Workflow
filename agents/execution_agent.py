@@ -37,6 +37,7 @@ class ExecutionAgent:
         certainty: float = 0.7,
         depth: int = 2,
         goal=None,
+        kernel=None,
     ):
         self.agent_id = agent_id
         self.instruction = instruction  # 编排层下发的设备级指令
@@ -47,11 +48,14 @@ class ExecutionAgent:
         self.certainty = certainty
         self.depth = depth
         self.goal = goal
+        self.kernel = kernel
 
     def execute(self) -> dict:
         """
         执行 S3 完整流程。
         """
+        if self.kernel is not None:
+            return self.kernel.commit_action(self.instruction, self.permission)
         indent = "  " * self.depth
         logger.info(f"{indent}[{self.agent_id}] 执行: {self.instruction.get('description', '')}")
 

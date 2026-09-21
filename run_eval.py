@@ -107,7 +107,7 @@ def run_once(scenario_name: str, config_name: str, repeat: int) -> dict:
                             for entry in root_result["execution_log"] if not entry["result"].get("success")]
                 error = "; ".join(failures[-3:]) or "任务未完成或目标电压未达到"
         # 始终在执行代理修改过的同一个最终网络对象上重新计算潮流。
-        pp.runpp(network.net, algorithm="nr", init="results")
+        pp.runpp(network.net, algorithm="nr", init="results", numba=False)
         final_voltage = round(float(network.net.res_bus.at[target, "vm_pu"]), 6)
         success = bool(final_voltage >= 1.0 and check_constraints(network.net)["all_satisfied"])
     except LLMServiceUnavailable as exc:

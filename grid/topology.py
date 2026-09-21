@@ -69,7 +69,7 @@ def compute_coupling_strength(net, bus_id: int) -> float:
     """
     # 确保潮流已经计算过，这样内部的 _ppc 才有导纳矩阵
     if not hasattr(net, "_ppc") or net._ppc is None:
-        pp.runpp(net)
+        pp.runpp(net, numba=False)
 
     # ---- 提取全网导纳矩阵 (Y-bus) ----
     # pandapower 潮流计算后，Y-bus 存储在内部 pypower 格式中
@@ -150,7 +150,7 @@ def compute_topology_depth(net, bus_id: int) -> int:
     # 在目标母线上临时增加 1MW 负荷作为扰动
     pp.create_load(net_copy, bus=bus_id, p_mw=1.0, q_mvar=0.0, name="perturbation")
     try:
-        pp.runpp(net_copy, algorithm="nr", init="results")
+        pp.runpp(net_copy, algorithm="nr", init="results", numba=False)
     except pp.powerflow.LoadflowNotConverged:
         # 如果加扰动后潮流不收敛，说明影响极大
         return max(d for _, d in 
@@ -261,7 +261,7 @@ def compute_regional_d0(net, target_bus: int) -> dict:
     distances = nx.single_source_shortest_path_length(graph, target_bus, cutoff=CASE39_MAX_B)
     changed = copy.deepcopy(net)
     pp.create_load(changed, bus=target_bus, p_mw=1.0, q_mvar=0.0)
-    pp.runpp(changed, algorithm="nr", init="results")
+    pp.runpp(changed, algorithm="nr", init="results", numba=False)
     delta = {int(i): abs(float(changed.res_bus.at[i, "vm_pu"] - net.res_bus.at[i, "vm_pu"]))
              for i in distances}
     first = max((delta[i] for i, hop in distances.items() if hop == 1), default=0.0)
@@ -304,7 +304,7 @@ def regional_scope(net, target_buses: list[int], forbidden_regions=()) -> dict:
             continue
         changed = copy.deepcopy(net)
         changed.gen.at[gen_id, "vm_pu"] += .02
-        pp.runpp(changed, algorithm="nr", init="results")
+        pp.runpp(changed, algorithm="nr", init="results", numba=False)
         responses[int(gen_id)] = max(abs(float(changed.res_bus.at[target, "vm_pu"] - net.res_bus.at[target, "vm_pu"]))
                                      for target in target_buses)
     peak = max(responses.values(), default=0.0)

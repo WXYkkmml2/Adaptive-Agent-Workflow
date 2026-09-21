@@ -50,6 +50,8 @@ class Planner:
             "tree_depth": H 值,
         }
         """
+        if self.network.case == "case39":
+            return self._plan_regional(instruction)
         logger.info(f"S1 开始规划: {instruction}")
 
         # ---- 1. 解析目标设备 ----
@@ -92,6 +94,8 @@ class Planner:
         原文档："稿件有缺失，这里可以用 NLP 等等"
         MVP 用正则匹配。
         """
+        if self.network.case == "case39":
+            return self._parse_targets(instruction)
         # 匹配 "Bus X" 或 "母线X" 或 "节点X"
         patterns = [
             r"[Bb]us\s*(\d+)",
@@ -111,6 +115,70 @@ class Planner:
         # 没找到明确目标，默认 Bus 13（最末端，常用测试点）
         logger.warning("未能解析目标母线，默认使用 Bus 13")
         return 13
+
+    def _parse_targets(self, instruction):
+        """Resolve each permitted region's lowest voltage buses, including ties."""
+        from grid.goal import Goal, goal_status
+        goal = Goal.from_instruction(instruction)
+        targets = {}
+        for zone, violations in goal_status(self.network.net, goal)["violations_by_zone"].items():
+            if int(zone) in goal.forbidden_regions:
+                continue
+            low = [v for v in violations if v["type"] == "voltage_low"]
+            if low:
+                minimum = min(v["value"] for v in low)
+                targets[int(zone)] = [v["bus_id"] for v in low if abs(v["value"] - minimum) < 1e-5]
+        return targets
+
+    def _plan_regional(self, instruction):
+        import json
+        from grid.goal import Goal, goal_status
+        from grid.topology import regional_scope, regional_tree_depth
+        from llm.prompts import CASE39_PLANNER_SYSTEM
+        from config.settings import CASE39_TEMPERATURE, CASE39_MAX_TOKENS
+        targets = self._parse_targets(instruction)
+        if not targets:
+            raise ValueError("No regional low-voltage targets")
+        goal = Goal.from_instruction(instruction)
+        scope = regional_scope(self.network.net, [b for ids in targets.values() for b in ids], goal.forbidden_regions)
+        response = self.llm.complete_json(CASE39_PLANNER_SYSTEM, json.dumps({
+            "instruction": instruction, "targets_by_region": targets,
+            "current_goal": goal_status(self.network.net, goal),
+            "d0": [{k: v for k, v in i.items() if k in ("bus_id", "d0", "topology_depth_b")} for i in scope["d0_info"]]
+        }, ensure_ascii=False), temperature=CASE39_TEMPERATURE, max_tokens=CASE39_MAX_TOKENS, source="planner")
+        if not isinstance(response, dict):
+            raise ValueError("Planner response must be an object")
+        if response.get("error") == "LLM_ERROR":
+            if response.get("retryable"):
+                raise LLMServiceUnavailable(response.get("message", "service unavailable"))
+            raise ValueError(response.get("message", "Invalid planner response"))
+        dag = TaskDAG()
+        items = response.get("tasks")
+        if not isinstance(items, list) or not items:
+            raise ValueError("LLM did not produce a DAG")
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
+                raise ValueError("Planner task requires explicit id")
+            if not isinstance(item.get("devices"), list) or not item["devices"]:
+                raise ValueError("Planner task requires explicit devices")
+            kind = item.get("device_type")
+            if kind not in ("bus", "gen", "line", "trafo"):
+                raise ValueError("Invalid task device_type")
+            if any(isinstance(i, bool) or not isinstance(i, int) or i not in self.network.net[kind].index for i in item["devices"]):
+                raise ValueError("Invalid task device index")
+            if (not isinstance(item.get("dependencies"), list)
+                    or any(not isinstance(d, str) for d in item["dependencies"])):
+                raise ValueError("Task requires dependencies array of IDs")
+            if not isinstance(item.get("description"), str) or not item["description"].strip():
+                raise ValueError("Task requires description")
+            dag.add_task(Task(id=item["id"], description=item.get("description", ""),
+                              devices=item["devices"], device_type=kind, dependencies=item["dependencies"]))
+        if not dag.tasks:
+            raise ValueError("LLM did not produce a DAG")
+        dag.validate()
+        return {"instruction": instruction, "target_bus": None, "targets_by_region": targets,
+                "dag": dag, "scope": scope, "d0_info": {"d0": max(i["d0"] for i in scope["d0_info"])},
+                "certainty": self._compute_certainty(dag), "tree_depth": regional_tree_depth(scope, self.network.net)}
 
     def _generate_task_dag(self, instruction: str, target_bus: int, d0_info: dict) -> TaskDAG:
         """

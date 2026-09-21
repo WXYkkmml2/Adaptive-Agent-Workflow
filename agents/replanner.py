@@ -215,3 +215,27 @@ class Replanner:
         if not summary and "vm_pu" in result:
             summary["vm_pu"] = result["vm_pu"]
         return summary
+
+    def rebuild_joint(self, root, task_id):
+        """Invalidate the failed path only; completed tasks are immutable locally."""
+        from agents.task import TaskStatus
+        invalid = {task_id}
+        changed = True
+        while changed:
+            changed = False
+            for tid, task in root.dag.tasks.items():
+                if set(task.dependencies) & invalid and tid not in invalid:
+                    invalid.add(tid)
+                    changed = True
+        for tid in invalid:
+            task = root.dag.tasks[tid]
+            if task.status != TaskStatus.COMPLETED:
+                task.status = TaskStatus.PENDING
+                root.joint_plans.pop(tid, None)
+                root.joint_agents.pop(tid, None)
+                root.joint_permissions.pop(tid, None)
+        for branch in list(root.branch_agents):
+            if set(branch) & invalid:
+                root.branch_agents.pop(branch)
+        root.kernel.replanned.append(task_id)
+        return invalid
