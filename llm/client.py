@@ -115,6 +115,11 @@ class RealLLMClient(LLMClient):
                 raise LLMServiceUnavailable(f"LLM API 暂时不可用 (HTTP {exc.code})；请稍后续跑") from exc
             raise ValueError(f"LLM API 预检失败 (HTTP {exc.code})；请检查模型名称和服务地址") from exc
         except urllib.error.URLError as exc:
+            if "CERTIFICATE_VERIFY_FAILED" in str(exc.reason):
+                raise ValueError(
+                    "LLM API TLS 证书校验失败；请设置 SSL_CERT_FILE 为可信 CA bundle 路径，"
+                    "或安装当前 Python 环境的 CA 证书。不要关闭证书校验。"
+                ) from exc
             raise LLMServiceUnavailable(f"LLM API 预检网络失败: {exc.reason}") from exc
         except (socket.timeout, TimeoutError) as exc:
             raise LLMServiceUnavailable("LLM API 预检超时；请稍后续跑") from exc
@@ -205,6 +210,8 @@ class RealLLMClient(LLMClient):
             except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
                 message = f"LLM 网络错误/超时: {exc}"
                 logger.warning("[LLM] %s: source=%s, attempt=%d/%d", message, source, attempt, retries)
+                if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+                    return error("LLM TLS 证书校验失败；设置 SSL_CERT_FILE 为可信 CA bundle 路径", retryable=True)
                 if attempt == retries:
                     return error(message, retryable=True)
                 time.sleep(min(2 ** (attempt - 1), 8))

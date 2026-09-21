@@ -14,7 +14,7 @@ from grid.tools import (check_constraints, constraints_not_worse, get_tool_catal
                         reset_tool_counters, get_tool_counters, simulate_action,
                         validate_tool_call, get_available_tools)
 from grid.topology import regional_scope, regional_tree_depth
-from llm.client import RealLLMClient
+from llm.client import RealLLMClient, LLMServiceUnavailable
 
 METHODS = ("hierarchical", "two_layer", "two_layer_full_restart")
 FIELDS = ("method", "repeat", "success", "real_actions_used", "wasted_actions",
@@ -95,6 +95,8 @@ class Case39Trial:
         response = self.llm.complete_json(system, json.dumps(context, ensure_ascii=False, default=str),
                                           temperature=CASE39_TEMPERATURE, source="case39", max_tokens=1024)
         if response.get("error") == "LLM_ERROR":
+            if response.get("retryable"):
+                raise LLMServiceUnavailable(response.get("message", "LLM 服务暂时不可用"))
             raise RuntimeError(response.get("message", "LLM_ERROR"))
         actions = response.get("actions", [])
         self.proposed.append({"region": region, "actions": actions})
@@ -197,6 +199,8 @@ class Case39Trial:
                 self.feedback = json.dumps(goal_status(self.network.net, self.goal), ensure_ascii=False)
                 error = "真实执行后全网未达标"
                 self.replanned.append("region1" if self.method == "hierarchical" else "all")
+            except LLMServiceUnavailable:
+                raise
             except (ValueError, RuntimeError) as exc:
                 error = str(exc)
                 self.feedback = error
@@ -234,6 +238,8 @@ def main():
     args = parser.parse_args()
     if args.repeats < 10:
         parser.error("正式比较每种方法至少运行10次")
+    client = RealLLMClient()
+    client.check_connection()
     validate_scenario()
     rows = []
     for repeat in range(1, args.repeats + 1):
