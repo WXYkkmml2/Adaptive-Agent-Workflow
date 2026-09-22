@@ -57,7 +57,7 @@ ROOT_PERMISSION = {
 # ============================================================
 MAX_REPLAN_ATTEMPTS = 3   # 最大重规划次数（Step 3 用）
 
-# Frozen case39 protocol v2; never tune against formal runs.
+# Frozen case39 protocol v3; never tune against formal runs.
 CASE39_MAX_TOKENS = 2048
 CASE39_MAX_ATTEMPTS = 3
-CASE39_PROMPT_VERSION = "case39-v2"
+CASE39_PROMPT_VERSION = "case39-v3"

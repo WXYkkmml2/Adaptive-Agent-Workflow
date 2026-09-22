@@ -306,13 +306,20 @@ def test_ablation_switches_and_depth_are_used(monkeypatch):
     assert row['real_actions_used'] == row['wasted_actions'] == 4
 
 
-def test_trap_prompts_never_include_private_number_or_witness():
+def test_trap_prompts_reveal_actual_value_only_after_real_execution():
     for method in METHODS:
         client = ScriptedLLM(trap=True)
         Case39Trial(method, client).run()
+        leaf_contexts = [context for _, context, kwargs in client.prompts
+                         if kwargs['source'] != 'planner']
+        initial_prompts = json.dumps([context for context in leaf_contexts if not context['feedback']],
+                                     ensure_ascii=False)
         prompts = json.dumps(client.prompts, ensure_ascii=False)
-        assert '1.03' not in prompts
+        assert '1.03' not in initial_prompts
         assert 'vm_max' not in prompts and 'witness' not in prompts
+        feedback = [context['feedback'] for context in leaf_contexts if context['feedback']]
+        assert any('gen_id=8' in item and 'vm_pu=1.06' in item and '实测仅达到 1.0300' in item
+                   for item in feedback)
 
 
 def test_common_gate_compares_adjacent_prefixes(monkeypatch):

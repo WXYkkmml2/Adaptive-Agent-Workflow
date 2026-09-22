@@ -151,7 +151,11 @@ class DispatchKernel:
             self.wasted_indices.add(index)
             return {"success": False, "error": "真实操作新增或恶化越限"}
         if clipped:
-            return {"success": False, "error": "PARAMETER 偏差：设定请求与实测不符，请依据当前断面重规划"}
+            return {"success": False, "error": (
+                f"PARAMETER 偏差：gen_id={action['gen_id']} 请求 vm_pu={action['vm_pu']}，"
+                f"实测仅达到 {actual:.4f}。该设备本轮可能已达到其物理调节上限，"
+                f"请勿再对同一设备发起更高目标值，应改为提高其他允许操作范围内机组的调节量以补偿剩余缺口。"
+            )}
         return {"success": True}
 
     def failure(self, error):
